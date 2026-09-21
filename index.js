@@ -1741,3 +1741,1668 @@ async function sendChatLog(message, action = 'MESSAGE') {
     });
   }
 }
+// ============================================================
+// 13) MESSAGE EVENTS
+// ============================================================
+client.on(Events.MessageCreate, async message => {
+  try {
+    await sendChatLog(message, 'MESSAGE');
+  } catch (err) {
+    logError('MESSAGE_CREATE', err, {
+      guildId: message?.guild?.id,
+      channelId: message?.channelId,
+      messageId: message?.id
+    });
+  }
+});
+
+client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
+  try {
+    if (newMessage.partial) {
+      newMessage = await newMessage.fetch().catch(() => newMessage);
+    }
+
+    if (!newMessage?.guild || !newMessage?.author) return;
+    if (newMessage.author.bot) return;
+
+    const oldContent = cleanLogText(oldMessage?.content);
+    const newContent = cleanLogText(newMessage?.content);
+
+    const oldAttachments = oldMessage?.attachments?.size || 0;
+    const newAttachments = newMessage?.attachments?.size || 0;
+
+    if (
+      oldContent === newContent &&
+      oldAttachments === newAttachments
+    ) {
+      return;
+    }
+
+    const config = await getGenerator(newMessage.guild.id);
+    if (!config) return;
+
+    const shouldTrack =
+      String(newMessage.channelId) ===
+        String(config.tracked_text_channel_id) ||
+      Boolean(await getRoom(newMessage.channelId));
+
+    if (!shouldTrack) return;
+
+    const blog = await getBlogChannel(newMessage.guild);
+    if (!blog) return;
+
+    if (String(newMessage.channelId) === String(blog.id)) return;
+
+    const member =
+      newMessage.member ||
+      await newMessage.guild.members
+        .fetch(newMessage.author.id)
+        .catch(() => null);
+
+    const name = cleanDisplayName(
+      member || { user: newMessage.author }
+    );
+
+    const before = oldContent || '(không có nội dung chữ)';
+    const after = newContent || '(không có nội dung chữ)';
+
+    const time = vietnamTime(new Date());
+
+    let text =
+      `[ĐÃ SỬA] ${name} » ` +
+      `"${before.slice(0, 700)}" → "${after.slice(0, 700)}"`;
+
+    const links = extractLinks(newMessage.content);
+
+    if (links.length) {
+      text += `\n🔗 Liên kết: ${links.join(' • ').slice(0, 1200)}`;
+    }
+
+    if (newMessage.attachments?.size) {
+      const attachmentNames = [...newMessage.attachments.values()]
+        .map(att =>
+          String(att.name || 'tệp')
+            .replace(/\r?\n/g, ' ')
+            .slice(0, 100)
+        )
+        .join(' • ');
+
+      text += `\n📎 Tệp đính kèm: ${attachmentNames.slice(0, 1200)}`;
+    }
+
+    text += `\n${time}`;
+
+    const files = [];
+
+    if (newMessage.attachments?.size) {
+      for (
+        const attachment of
+        [...newMessage.attachments.values()].slice(0, 10)
+      ) {
+        const downloaded =
+          await downloadAttachmentForLog(attachment);
+
+        if (downloaded) files.push(downloaded);
+      }
+    }
+
+    await blog.send({
+      content: text.slice(0, 1950),
+      files,
+      allowedMentions: {
+        parse: []
+      }
+    }).catch(async err => {
+      logError('MESSAGE_UPDATE_LOG', err, {
+        guildId: newMessage.guild.id,
+        messageId: newMessage.id
+      });
+
+      await blog.send({
+        content: text.slice(0, 1950),
+        allowedMentions: {
+          parse: []
+        }
+      }).catch(() => {});
+    });
+  } catch (err) {
+    logError('MESSAGE_UPDATE', err, {
+      guildId: newMessage?.guild?.id,
+      channelId: newMessage?.channelId,
+      messageId: newMessage?.id
+    });
+  }
+});
+
+client.on(Events.MessageDelete, async message => {
+  try {
+    if (!message?.guild) return;
+
+    if (message.partial) {
+      // Tin đã xóa không phải lúc nào cũng fetch lại được.
+      // Nếu cache còn dữ liệu thì tiếp tục ghi log.
+      if (!message.author) return;
+    }
+
+    if (!message.author || message.author.bot) return;
+
+    await sendChatLog(message, 'DELETE');
+  } catch (err) {
+    logError('MESSAGE_DELETE', err, {
+      guildId: message?.guild?.id,
+      channelId: message?.channelId,
+      messageId: message?.id
+    });
+  }
+});
+
+// ============================================================
+// 14) VOICE STATE EVENTS
+// ============================================================
+client.on(
+  Events.VoiceStateUpdate,
+  async (oldState, newState) => {
+    try {
+      const guild = newState.guild || oldState.guild;
+      if (!guild) return;
+
+      const config = await getGenerator(guild.id);
+      if (!config) return;
+
+      const member = newState.member || oldState.member;
+      if (!member || member.user.bot) return;
+
+      // Thành viên vừa vào phòng "Tạo Phòng".
+      if (
+        newState.channelId &&
+        String(newState.channelId) ===
+          String(config.generator_id) &&
+        String(oldState.channelId) !==
+          String(config.generator_id)
+      ) {
+        try {
+          await createRoom(member, config);
+        } catch (err) {
+          logError('VOICE_CREATE_ROOM', err, {
+            guildId: guild.id,
+            userId: member.id
+          });
+
+          // Nếu tạo thất bại, cố gắng đưa user ra khỏi generator.
+          if (
+            member.voice.channelId ===
+            String(config.generator_id)
+          ) {
+            await member.voice
+              .disconnect('Không thể tạo Temp Voice')
+              .catch(() => {});
+          }
+        }
+      }
+
+      // Phòng cũ: cập nhật panel hoặc xóa nếu trống.
+      if (
+        oldState.channelId &&
+        String(oldState.channelId) !==
+          String(config.generator_id)
+      ) {
+        const oldRoom = await getRoom(oldState.channelId);
+
+        if (oldRoom) {
+          const oldChannel =
+            oldState.channel ||
+            await guild.channels
+              .fetch(oldState.channelId)
+              .catch(() => null);
+
+          if (
+            oldChannel &&
+            oldChannel.type === ChannelType.GuildVoice
+          ) {
+            const humans = oldChannel.members.filter(
+              m => !m.user.bot
+            );
+
+            if (humans.size === 0) {
+              await deleteTempRoom(oldChannel);
+            } else {
+              const selected =
+                selectedMembers.get(
+                  selectedKey(oldChannel.id)
+                );
+
+              if (
+                selected &&
+                String(selected.targetId) === String(member.id) &&
+                member.voice.channelId !== oldChannel.id
+              ) {
+                clearSelectedMember(oldChannel.id);
+              }
+
+              await refreshPanelSafe(oldChannel);
+            }
+          }
+        }
+      }
+
+      // Phòng mới: cập nhật số người trên panel.
+      if (
+        newState.channelId &&
+        String(newState.channelId) !==
+          String(config.generator_id)
+      ) {
+        const newRoom = await getRoom(newState.channelId);
+
+        if (newRoom) {
+          const newChannel =
+            newState.channel ||
+            await guild.channels
+              .fetch(newState.channelId)
+              .catch(() => null);
+
+          if (
+            newChannel &&
+            newChannel.type === ChannelType.GuildVoice
+          ) {
+            await refreshPanelSafe(newChannel);
+          }
+        }
+      }
+    } catch (err) {
+      logError('VOICE_STATE', err, {
+        guildId:
+          newState?.guild?.id ||
+          oldState?.guild?.id,
+        userId:
+          newState?.id ||
+          oldState?.id,
+        oldChannelId: oldState?.channelId,
+        newChannelId: newState?.channelId
+      });
+    }
+  }
+);
+
+// ============================================================
+// 15) BUTTON / SELECT / MODAL HANDLERS
+// ============================================================
+async function handleMemberSelect(interaction) {
+  const data = await requireOwner(interaction);
+  if (!data) return;
+
+  if (!checkCooldown(interaction.user.id, 'member_select')) {
+    return shortReply(
+      interaction,
+      '⏳ Thao tác quá nhanh, thử lại sau một chút.'
+    );
+  }
+
+  const targetId = interaction.values?.[0];
+
+  if (!targetId || !isSnowflake(targetId)) {
+    return shortReply(
+      interaction,
+      '❌ Thành viên được chọn không hợp lệ.'
+    );
+  }
+
+  if (String(targetId) === String(interaction.user.id)) {
+    return shortReply(
+      interaction,
+      '❌ Bạn không cần chọn chính mình.'
+    );
+  }
+
+  if (String(targetId) === String(client.user.id)) {
+    return shortReply(
+      interaction,
+      '❌ Không thể chọn bot.'
+    );
+  }
+
+  const target = await interaction.guild.members
+    .fetch(targetId)
+    .catch(() => null);
+
+  if (!target) {
+    return shortReply(
+      interaction,
+      '❌ Không tìm thấy thành viên này trong máy chủ.'
+    );
+  }
+
+  setSelectedMember(
+    data.channel.id,
+    data.room.owner_id,
+    target.id
+  );
+
+  await interaction.deferUpdate();
+
+  await refreshPanelSafe(data.channel);
+
+  await interaction.followUp({
+    content: `👤 Đã chọn **${cleanDisplayName(target)}**.`,
+    ephemeral: true
+  }).catch(() => {});
+}
+
+async function handleRegionSelect(interaction) {
+  const data = await requireOwner(interaction);
+  if (!data) return;
+
+  if (!checkCooldown(interaction.user.id, 'region')) {
+    return shortReply(
+      interaction,
+      '⏳ Bạn đổi khu vực quá nhanh.'
+    );
+  }
+
+  const value = interaction.values?.[0];
+
+  if (!value) {
+    return shortReply(
+      interaction,
+      '❌ Khu vực thoại không hợp lệ.'
+    );
+  }
+
+  await interaction.deferUpdate();
+
+  try {
+    if (value === '__AUTO__') {
+      await data.channel.setRTCRegion(null);
+    } else {
+      const regions = await getVoiceRegions(true);
+
+      if (!regions.some(region => region.id === value)) {
+        throw new Error(
+          `Khu vực thoại "${value}" không còn khả dụng.`
+        );
+      }
+
+      await data.channel.setRTCRegion(value);
+    }
+
+    const verified = await interaction.guild.channels
+      .fetch(data.channel.id)
+      .catch(() => null);
+
+    if (!verified) {
+      throw new Error(
+        'Không thể xác minh phòng sau khi đổi khu vực.'
+      );
+    }
+
+    if (
+      value === '__AUTO__' &&
+      verified.rtcRegion !== null
+    ) {
+      throw new Error(
+        'Discord chưa áp dụng chế độ khu vực tự động.'
+      );
+    }
+
+    if (
+      value !== '__AUTO__' &&
+      verified.rtcRegion !== value
+    ) {
+      throw new Error(
+        'Discord chưa áp dụng khu vực đã chọn.'
+      );
+    }
+
+    await refreshPanelSafe(verified);
+
+    await interaction.followUp({
+      content:
+        value === '__AUTO__'
+          ? '🌐 Đã chuyển khu vực thoại về **Tự động**.'
+          : `🌐 Đã đổi khu vực thoại thành **${value}**.`,
+      ephemeral: true
+    }).catch(() => {});
+  } catch (err) {
+    logError('REGION_CHANGE', err, {
+      guildId: interaction.guild.id,
+      channelId: data.channel.id,
+      value
+    });
+
+    await interaction.followUp({
+      content:
+        '❌ Không thể đổi khu vực thoại. Discord có thể đã thay đổi danh sách khu vực.',
+      ephemeral: true
+    }).catch(() => {});
+  }
+}
+
+async function handleOwnerButton(interaction) {
+  const data = await requireOwner(interaction);
+  if (!data) return;
+
+  const action = interaction.customId;
+
+  if (!checkCooldown(interaction.user.id, action)) {
+    return shortReply(
+      interaction,
+      '⏳ Thao tác quá nhanh, vui lòng thử lại.'
+    );
+  }
+
+  if (action === 'vc_lock') {
+    await interaction.deferUpdate();
+    await setRoomLocked(data.channel, true);
+    await refreshPanelSafe(data.channel);
+
+    return interaction.followUp({
+      content: '🔒 Đã khóa phòng.',
+      ephemeral: true
+    }).catch(() => {});
+  }
+
+  if (action === 'vc_unlock') {
+    await interaction.deferUpdate();
+    await setRoomLocked(data.channel, false);
+    await refreshPanelSafe(data.channel);
+
+    return interaction.followUp({
+      content: '🔓 Đã mở phòng.',
+      ephemeral: true
+    }).catch(() => {});
+  }
+
+  if (action === 'vc_hide') {
+    await interaction.deferUpdate();
+    await setRoomHidden(data.channel, true);
+    await refreshPanelSafe(data.channel);
+
+    return interaction.followUp({
+      content: '🙈 Đã ẩn phòng.',
+      ephemeral: true
+    }).catch(() => {});
+  }
+
+  if (action === 'vc_show') {
+    await interaction.deferUpdate();
+    await setRoomHidden(data.channel, false);
+    await refreshPanelSafe(data.channel);
+
+    return interaction.followUp({
+      content: '👁 Đã hiển thị phòng.',
+      ephemeral: true
+    }).catch(() => {});
+  }
+
+  if (action === 'vc_rename') {
+    return interaction.showModal(
+      renameModal(data.channel)
+    );
+  }
+
+  if (action === 'vc_limit') {
+    return interaction.showModal(
+      limitModal(data.channel)
+    );
+  }
+
+  if (action === 'vc_reset') {
+    return safeReply(interaction, {
+      content:
+        '♻️ **Đặt lại phòng?**\n' +
+        'Phòng sẽ được mở, hiện lại, bỏ giới hạn, trả khu vực về Tự động và xóa các quyền thành viên tùy chỉnh.',
+      components: resetConfirmComponents(),
+      ephemeral: true
+    });
+  }
+
+  if (action === 'vc_allow') {
+    const target = await resolveSelectedTarget(
+      interaction,
+      data
+    );
+
+    if (!target) return;
+
+    await interaction.deferReply({ ephemeral: true });
+
+    await allowMember(data.channel, target);
+    await refreshPanelSafe(data.channel);
+
+    return interaction.editReply({
+      content:
+        `✅ Đã cấp quyền vào phòng cho **${cleanDisplayName(target)}**.`
+    });
+  }
+
+  if (action === 'vc_deny') {
+    const target = await resolveSelectedTarget(
+      interaction,
+      data
+    );
+
+    if (!target) return;
+
+    await interaction.deferReply({ ephemeral: true });
+
+    await denyMember(data.channel, target);
+    clearSelectedMember(data.channel.id);
+    await refreshPanelSafe(data.channel);
+
+    return interaction.editReply({
+      content:
+        `⛔ Đã cấm **${cleanDisplayName(target)}** khỏi phòng.`
+    });
+  }
+
+  if (action === 'vc_kick') {
+    const target = await resolveSelectedTarget(
+      interaction,
+      data,
+      { mustBeInRoom: true }
+    );
+
+    if (!target) return;
+
+    await interaction.deferReply({ ephemeral: true });
+
+    await kickMember(data.channel, target);
+    clearSelectedMember(data.channel.id);
+    await refreshPanelSafe(data.channel);
+
+    return interaction.editReply({
+      content:
+        `👢 Đã đuổi **${cleanDisplayName(target)}** khỏi phòng.`
+    });
+  }
+
+  if (action === 'vc_transfer') {
+    const target = await resolveSelectedTarget(
+      interaction,
+      data,
+      { mustBeInRoom: true }
+    );
+
+    if (!target) return;
+
+    await interaction.deferReply({ ephemeral: true });
+
+    await createTransferRequest(
+      interaction,
+      data,
+      target
+    );
+
+    return interaction.editReply({
+      content:
+        `👑 Đã gửi yêu cầu chuyển chủ cho **${cleanDisplayName(target)}**.`
+    });
+  }
+}
+// ============================================================
+// 16) RESET CONFIRM
+// ============================================================
+async function handleResetConfirm(interaction) {
+  if (interaction.customId === 'vc_reset_cancel') {
+    return interaction.update({
+      content: '❎ Đã hủy đặt lại phòng.',
+      components: []
+    });
+  }
+
+  const data = await requireOwner(interaction);
+  if (!data) return;
+
+  if (!checkCooldown(interaction.user.id, 'reset_confirm')) {
+    return shortReply(
+      interaction,
+      '⏳ Thao tác quá nhanh, vui lòng thử lại.'
+    );
+  }
+
+  await interaction.deferUpdate();
+
+  try {
+    await resetRoom(
+      data.channel,
+      data.room.owner_id
+    );
+
+    await refreshPanelSafe(
+      data.channel,
+      true
+    );
+
+    await interaction.editReply({
+      content: '♻️ Đã đặt lại phòng thành công.',
+      components: []
+    });
+  } catch (err) {
+    logError('RESET_ROOM', err, {
+      guildId: interaction.guild.id,
+      channelId: data.channel.id,
+      ownerId: data.room.owner_id
+    });
+
+    await interaction.editReply({
+      content: '❌ Không thể đặt lại phòng.',
+      components: []
+    }).catch(() => {});
+  }
+}
+
+// ============================================================
+// 17) MODAL SUBMIT
+// ============================================================
+async function handleModalSubmit(interaction) {
+  if (interaction.customId === 'vc_modal_rename') {
+    const data = await requireOwner(interaction);
+    if (!data) return;
+
+    if (!checkCooldown(interaction.user.id, 'rename_modal')) {
+      return shortReply(
+        interaction,
+        '⏳ Bạn đổi tên quá nhanh.'
+      );
+    }
+
+    let name = interaction.fields
+      .getTextInputValue('room_name')
+      .replace(/\r?\n/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    name = name
+      .replace(/^🔊・/, '')
+      .replace(/[\/\\#:@]/g, '')
+      .trim();
+
+    if (!name) {
+      return shortReply(
+        interaction,
+        '❌ Tên phòng không hợp lệ.'
+      );
+    }
+
+    const finalName = `${ROOM_PREFIX}${name}`
+      .slice(0, 100);
+
+    await interaction.deferReply({
+      ephemeral: true
+    });
+
+    try {
+      await data.channel.setName(
+        finalName,
+        `Chủ phòng ${interaction.user.tag} đổi tên`
+      );
+
+      await refreshPanelSafe(data.channel);
+
+      await interaction.editReply({
+        content: `✏️ Đã đổi tên phòng thành **${finalName}**.`
+      });
+    } catch (err) {
+      logError('ROOM_RENAME', err, {
+        guildId: interaction.guild.id,
+        channelId: data.channel.id
+      });
+
+      await interaction.editReply({
+        content:
+          '❌ Không thể đổi tên phòng. Có thể Discord đang giới hạn tốc độ đổi tên kênh.'
+      });
+    }
+
+    return;
+  }
+
+  if (interaction.customId === 'vc_modal_limit') {
+    const data = await requireOwner(interaction);
+    if (!data) return;
+
+    if (!checkCooldown(interaction.user.id, 'limit_modal')) {
+      return shortReply(
+        interaction,
+        '⏳ Bạn thay đổi giới hạn quá nhanh.'
+      );
+    }
+
+    const raw = interaction.fields
+      .getTextInputValue('room_limit')
+      .trim();
+
+    if (!/^\d{1,2}$/.test(raw)) {
+      return shortReply(
+        interaction,
+        '❌ Giới hạn phải là số từ **0 đến 99**.'
+      );
+    }
+
+    const limit = Number(raw);
+
+    if (
+      !Number.isInteger(limit) ||
+      limit < 0 ||
+      limit > 99
+    ) {
+      return shortReply(
+        interaction,
+        '❌ Giới hạn phải nằm trong khoảng **0–99**.'
+      );
+    }
+
+    await interaction.deferReply({
+      ephemeral: true
+    });
+
+    try {
+      await data.channel.setUserLimit(limit);
+
+      await refreshPanelSafe(data.channel);
+
+      await interaction.editReply({
+        content:
+          limit === 0
+            ? '👥 Đã bỏ giới hạn số người.'
+            : `👥 Giới hạn phòng đã đặt thành **${limit} người**.`
+      });
+    } catch (err) {
+      logError('ROOM_LIMIT', err, {
+        guildId: interaction.guild.id,
+        channelId: data.channel.id,
+        limit
+      });
+
+      await interaction.editReply({
+        content: '❌ Không thể thay đổi giới hạn phòng.'
+      });
+    }
+
+    return;
+  }
+}
+
+// ============================================================
+// 18) TRANSFER ACCEPT / DECLINE
+// ============================================================
+async function handleTransferResponse(interaction) {
+  const parts = interaction.customId.split(':');
+  const action = parts[0];
+  const channelId = parts[1];
+
+  if (!channelId || !isSnowflake(channelId)) {
+    return shortReply(
+      interaction,
+      '❌ Yêu cầu chuyển chủ không hợp lệ.'
+    );
+  }
+
+  const pending = pendingTransfers.get(
+    String(channelId)
+  );
+
+  if (!pending) {
+    return interaction.update({
+      content:
+        '⌛ Yêu cầu chuyển chủ này không còn hiệu lực.',
+      components: []
+    }).catch(() =>
+      shortReply(
+        interaction,
+        '⌛ Yêu cầu chuyển chủ này không còn hiệu lực.'
+      )
+    );
+  }
+
+  if (Date.now() > pending.expiresAt) {
+    pendingTransfers.delete(String(channelId));
+
+    return interaction.update({
+      content: '⌛ Yêu cầu chuyển chủ đã hết hạn.',
+      components: []
+    }).catch(() => {});
+  }
+
+  if (
+    String(interaction.user.id) !==
+    String(pending.toUserId)
+  ) {
+    return shortReply(
+      interaction,
+      '⛔ Chỉ thành viên được chọn mới có thể phản hồi yêu cầu này.'
+    );
+  }
+
+  const channel = await interaction.guild.channels
+    .fetch(channelId)
+    .catch(() => null);
+
+  if (
+    !channel ||
+    channel.type !== ChannelType.GuildVoice
+  ) {
+    pendingTransfers.delete(String(channelId));
+
+    return interaction.update({
+      content: '❌ Phòng thoại không còn tồn tại.',
+      components: []
+    }).catch(() => {});
+  }
+
+  if (action === 'vc_transfer_decline') {
+    pendingTransfers.delete(String(channelId));
+
+    await interaction.update({
+      content:
+        `❎ <@${interaction.user.id}> đã từ chối nhận phòng.`,
+      components: [],
+      allowedMentions: {
+        users: [interaction.user.id]
+      }
+    });
+
+    console.log(
+      `[CHUYỂN CHỦ] ${interaction.user.id} đã từ chối | ${channel.name}`
+    );
+
+    return;
+  }
+
+  if (action !== 'vc_transfer_accept') return;
+
+  const room = await getRoom(channel.id);
+
+  if (
+    !room ||
+    String(room.owner_id) !==
+      String(pending.fromOwnerId)
+  ) {
+    pendingTransfers.delete(String(channelId));
+
+    return interaction.update({
+      content:
+        '❌ Chủ phòng đã thay đổi nên yêu cầu này bị hủy.',
+      components: []
+    }).catch(() => {});
+  }
+
+  const target = await interaction.guild.members
+    .fetch(interaction.user.id)
+    .catch(() => null);
+
+  if (
+    !target ||
+    target.voice.channelId !== channel.id
+  ) {
+    return shortReply(
+      interaction,
+      '❌ Bạn phải đang ở trong phòng để nhận quyền chủ phòng.'
+    );
+  }
+
+  await interaction.deferUpdate();
+
+  try {
+    await transferOwner(
+      channel,
+      pending.fromOwnerId,
+      pending.toUserId
+    );
+
+    await refreshPanelSafe(
+      channel,
+      true
+    );
+
+    await interaction.editReply({
+      content:
+        `👑 <@${pending.toUserId}> đã nhận quyền chủ phòng từ <@${pending.fromOwnerId}>.`,
+      components: [],
+      allowedMentions: {
+        users: [
+          pending.toUserId,
+          pending.fromOwnerId
+        ]
+      }
+    });
+
+    const blog = await getBlogChannel(
+      interaction.guild
+    );
+
+    if (blog) {
+      await blog.send({
+        content:
+          `[CHUYỂN CHỦ] <@${pending.fromOwnerId}> → <@${pending.toUserId}> • ${channel.name} • ${vietnamTime()}`,
+        allowedMentions: {
+          parse: []
+        }
+      }).catch(() => {});
+    }
+  } catch (err) {
+    logError('TRANSFER_ACCEPT', err, {
+      guildId: interaction.guild.id,
+      channelId,
+      fromOwnerId: pending.fromOwnerId,
+      toUserId: pending.toUserId
+    });
+
+    pendingTransfers.delete(String(channelId));
+
+    await interaction.editReply({
+      content:
+        '❌ Không thể hoàn tất chuyển chủ. Quyền sở hữu chưa được xác nhận.',
+      components: []
+    }).catch(() => {});
+  }
+}
+
+// ============================================================
+// 19) SLASH COMMAND HANDLERS
+// ============================================================
+async function handleTrackChannel(interaction) {
+  if (
+    !interaction.memberPermissions?.has(
+      PermissionsBitField.Flags.Administrator
+    )
+  ) {
+    return shortReply(
+      interaction,
+      '⛔ Chỉ quản trị viên mới sử dụng được lệnh này.'
+    );
+  }
+
+  const config = await getGenerator(
+    interaction.guild.id
+  );
+
+  if (!config) {
+    return shortReply(
+      interaction,
+      '❌ Máy chủ chưa được thiết lập. Hãy chạy `/setup` trước.'
+    );
+  }
+
+  const channel =
+    interaction.options.getChannel('channel');
+
+  if (
+    !channel ||
+    (
+      channel.type !== ChannelType.GuildText &&
+      channel.type !== ChannelType.GuildAnnouncement
+    )
+  ) {
+    return shortReply(
+      interaction,
+      '❌ Hãy chọn một kênh text hợp lệ.'
+    );
+  }
+
+  const me = interaction.guild.members.me;
+  const permissions = channel.permissionsFor(me);
+
+  const required = [
+    PermissionsBitField.Flags.ViewChannel,
+    PermissionsBitField.Flags.ReadMessageHistory
+  ];
+
+  const missing = required.filter(
+    flag => !permissions?.has(flag)
+  );
+
+  if (missing.length) {
+    return safeReply(interaction, {
+      content:
+        '❌ Bot chưa đủ quyền đọc kênh được chọn.\n' +
+        `Thiếu: **${permissionNames(missing).join(', ')}**`,
+      ephemeral: true
+    });
+  }
+
+  await updateTrackedChannel(
+    interaction.guild.id,
+    channel.id
+  );
+
+  await shortReply(
+    interaction,
+    `✅ Đã bật ghi nhận chat tại <#${channel.id}>.`
+  );
+
+  console.log(
+    `[THEO DÕI CHAT] ${interaction.guild.name} → ${channel.name}`
+  );
+}
+
+async function handleUntrackChannel(interaction) {
+  if (
+    !interaction.memberPermissions?.has(
+      PermissionsBitField.Flags.Administrator
+    )
+  ) {
+    return shortReply(
+      interaction,
+      '⛔ Chỉ quản trị viên mới sử dụng được lệnh này.'
+    );
+  }
+
+  const config = await getGenerator(
+    interaction.guild.id
+  );
+
+  if (!config) {
+    return shortReply(
+      interaction,
+      '❌ Máy chủ chưa được thiết lập.'
+    );
+  }
+
+  await clearTrackedChannel(
+    interaction.guild.id
+  );
+
+  await shortReply(
+    interaction,
+    '✅ Đã tắt ghi nhận kênh chat.'
+  );
+
+  console.log(
+    `[THEO DÕI CHAT] Đã tắt tại ${interaction.guild.name}`
+  );
+}
+
+async function handlePanelCommand(interaction) {
+  const member = await interaction.guild.members
+    .fetch(interaction.user.id)
+    .catch(() => null);
+
+  if (!member?.voice?.channelId) {
+    return shortReply(
+      interaction,
+      '❌ Bạn phải đang ở trong Temp Voice cần khôi phục panel.'
+    );
+  }
+
+  const room = await getRoom(
+    member.voice.channelId
+  );
+
+  if (!room) {
+    return shortReply(
+      interaction,
+      '❌ Phòng hiện tại không phải Temp Voice của Voice HDK.'
+    );
+  }
+
+  if (
+    String(room.owner_id) !==
+      String(interaction.user.id) &&
+    !interaction.memberPermissions?.has(
+      PermissionsBitField.Flags.Administrator
+    )
+  ) {
+    return shortReply(
+      interaction,
+      '⛔ Chỉ chủ phòng hoặc quản trị viên mới có thể khôi phục panel.'
+    );
+  }
+
+  const channel = member.voice.channel;
+
+  await interaction.deferReply({
+    ephemeral: true
+  });
+
+  const panel = await refreshPanelSafe(
+    channel,
+    true
+  );
+
+  if (!panel) {
+    return interaction.editReply({
+      content:
+        '❌ Không thể khôi phục bảng điều khiển. Hãy kiểm tra quyền của bot.'
+    });
+  }
+
+  await interaction.editReply({
+    content:
+      '✅ Bảng điều khiển đã được kiểm tra và khôi phục.'
+  });
+}
+
+async function handleDoctor(interaction) {
+  if (
+    !interaction.memberPermissions?.has(
+      PermissionsBitField.Flags.Administrator
+    )
+  ) {
+    return shortReply(
+      interaction,
+      '⛔ Chỉ quản trị viên mới sử dụng được `/doctor`.'
+    );
+  }
+
+  await interaction.deferReply({
+    ephemeral: true
+  });
+
+  const checks = [];
+
+  // Discord Gateway
+  checks.push(
+    client.isReady()
+      ? '✅ Discord Gateway'
+      : '❌ Discord Gateway'
+  );
+
+  // Database thật
+  try {
+    await pool.query('SELECT 1');
+    checks.push('✅ PostgreSQL');
+  } catch (err) {
+    checks.push('❌ PostgreSQL');
+    logError('DOCTOR_DB', err, {
+      guildId: interaction.guild.id
+    });
+  }
+
+  // Setup
+  let config = null;
+
+  try {
+    config = await getGenerator(
+      interaction.guild.id
+    );
+
+    checks.push(
+      config
+        ? '✅ Cấu hình máy chủ'
+        : '❌ Chưa chạy /setup'
+    );
+  } catch (err) {
+    checks.push('❌ Đọc cấu hình');
+  }
+
+  // Bot permissions
+  const missing = missingBotPermissions(
+    interaction.guild
+  );
+
+  checks.push(
+    missing.length
+      ? `❌ Thiếu quyền: ${permissionNames(missing).join(', ')}`
+      : '✅ Quyền bot'
+  );
+
+  // Generator
+  if (config?.generator_id) {
+    const generator =
+      await interaction.guild.channels
+        .fetch(config.generator_id)
+        .catch(() => null);
+
+    checks.push(
+      generator?.type === ChannelType.GuildVoice
+        ? '✅ Phòng tạo Temp Voice'
+        : '❌ Phòng tạo Temp Voice'
+    );
+  }
+
+  // Blog
+  if (config?.blog_channel_id) {
+    const blog =
+      await interaction.guild.channels
+        .fetch(config.blog_channel_id)
+        .catch(() => null);
+
+    checks.push(
+      blog?.type === ChannelType.GuildText
+        ? '✅ Kênh blog'
+        : '❌ Kênh blog'
+    );
+  }
+
+  // Voice regions thật
+  try {
+    const regions = await getVoiceRegions(true);
+
+    checks.push(
+      regions.length
+        ? `✅ Voice Regions (${regions.length})`
+        : '⚠️ Voice Regions không có dữ liệu'
+    );
+  } catch (err) {
+    checks.push('❌ Voice Regions');
+
+    logError('DOCTOR_REGIONS', err, {
+      guildId: interaction.guild.id
+    });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(
+      checks.some(x => x.startsWith('❌'))
+        ? 0xED4245
+        : 0x57F287
+    )
+    .setTitle(`${BOT_NAME} · Kiểm tra hệ thống`)
+    .setDescription(checks.join('\n'));
+
+  await interaction.editReply({
+    embeds: [embed]
+  });
+}
+// ============================================================
+// 20) MAIN INTERACTION ROUTER
+// ============================================================
+client.on(Events.InteractionCreate, async interaction => {
+  try {
+    if (!interaction.guild) {
+      if (interaction.isRepliable()) {
+        await safeReply(interaction, {
+          content:
+            '❌ Voice HDK chỉ hoạt động trong máy chủ Discord.',
+          ephemeral: true
+        });
+      }
+      return;
+    }
+
+    // --------------------------------------------------------
+    // SLASH COMMANDS
+    // --------------------------------------------------------
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === 'setup') {
+        await setupGuild(interaction);
+        return;
+      }
+
+      if (interaction.commandName === 'panel') {
+        await handlePanelCommand(interaction);
+        return;
+      }
+
+      if (interaction.commandName === 'doctor') {
+        await handleDoctor(interaction);
+        return;
+      }
+
+      if (interaction.commandName === 'track-channel') {
+        await handleTrackChannel(interaction);
+        return;
+      }
+
+      if (interaction.commandName === 'untrack-channel') {
+        await handleUntrackChannel(interaction);
+        return;
+      }
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // USER SELECT
+    // --------------------------------------------------------
+    if (
+      interaction.isUserSelectMenu() &&
+      interaction.customId === 'vc_member_select'
+    ) {
+      await handleMemberSelect(interaction);
+      return;
+    }
+
+    // --------------------------------------------------------
+    // REGION SELECT
+    // --------------------------------------------------------
+    if (
+      interaction.isStringSelectMenu() &&
+      interaction.customId === 'vc_region_select'
+    ) {
+      await handleRegionSelect(interaction);
+      return;
+    }
+
+    // --------------------------------------------------------
+    // MODALS
+    // --------------------------------------------------------
+    if (interaction.isModalSubmit()) {
+      if (
+        interaction.customId === 'vc_modal_rename' ||
+        interaction.customId === 'vc_modal_limit'
+      ) {
+        await handleModalSubmit(interaction);
+      }
+
+      return;
+    }
+
+    // --------------------------------------------------------
+    // BUTTONS
+    // --------------------------------------------------------
+    if (interaction.isButton()) {
+      if (
+        interaction.customId === 'vc_reset_confirm' ||
+        interaction.customId === 'vc_reset_cancel'
+      ) {
+        await handleResetConfirm(interaction);
+        return;
+      }
+
+      if (
+        interaction.customId.startsWith(
+          'vc_transfer_accept:'
+        ) ||
+        interaction.customId.startsWith(
+          'vc_transfer_decline:'
+        )
+      ) {
+        await handleTransferResponse(interaction);
+        return;
+      }
+
+      const ownerButtons = new Set([
+        'vc_lock',
+        'vc_unlock',
+        'vc_hide',
+        'vc_show',
+        'vc_rename',
+        'vc_reset',
+        'vc_limit',
+        'vc_allow',
+        'vc_transfer',
+        'vc_deny',
+        'vc_kick'
+      ]);
+
+      if (ownerButtons.has(interaction.customId)) {
+        await handleOwnerButton(interaction);
+        return;
+      }
+    }
+  } catch (err) {
+    logError('INTERACTION', err, {
+      guildId: interaction?.guild?.id,
+      channelId: interaction?.channelId,
+      userId: interaction?.user?.id,
+      commandName: interaction?.commandName,
+      customId: interaction?.customId
+    });
+
+    if (interaction?.isRepliable?.()) {
+      try {
+        if (interaction.deferred) {
+          await interaction.editReply({
+            content:
+              '❌ Đã xảy ra lỗi khi xử lý thao tác. Hãy thử lại.'
+          });
+        } else if (interaction.replied) {
+          await interaction.followUp({
+            content:
+              '❌ Đã xảy ra lỗi khi xử lý thao tác. Hãy thử lại.',
+            ephemeral: true
+          });
+        } else {
+          await interaction.reply({
+            content:
+              '❌ Đã xảy ra lỗi khi xử lý thao tác. Hãy thử lại.',
+            ephemeral: true
+          });
+        }
+      } catch (replyErr) {
+        logError('INTERACTION_ERROR_REPLY', replyErr, {
+          interactionId: interaction?.id
+        });
+      }
+    }
+  }
+});
+
+// ============================================================
+// 21) RECONCILE DATABASE ↔ DISCORD
+// ============================================================
+async function reconcileGuild(guild) {
+  const config = await getGenerator(guild.id);
+
+  if (!config) return;
+
+  const { rows } = await pool.query(
+    `SELECT *
+     FROM rooms
+     WHERE guild_id=$1`,
+    [guild.id]
+  );
+
+  for (const room of rows) {
+    try {
+      const channel = await guild.channels
+        .fetch(room.channel_id)
+        .catch(() => null);
+
+      if (
+        !channel ||
+        channel.type !== ChannelType.GuildVoice
+      ) {
+        await deleteRoomRecord(room.channel_id);
+
+        console.log(
+          `[ĐỒNG BỘ] Đã xóa dữ liệu phòng không còn tồn tại: ${room.channel_id}`
+        );
+
+        continue;
+      }
+
+      await ensureBotRoomPermissions(channel);
+
+      const owner = await guild.members
+        .fetch(room.owner_id)
+        .catch(() => null);
+
+      if (owner) {
+        await setOwnerAccess(
+          channel,
+          room.owner_id,
+          true
+        );
+      }
+
+      const humans = channel.members.filter(
+        member => !member.user.bot
+      );
+
+      if (humans.size === 0) {
+        await deleteTempRoom(channel);
+        continue;
+      }
+
+      await refreshPanelSafe(
+        channel,
+        true
+      );
+    } catch (err) {
+      logError('RECONCILE_ROOM', err, {
+        guildId: guild.id,
+        channelId: room.channel_id
+      });
+    }
+  }
+}
+
+async function reconcileAllGuilds() {
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      await reconcileGuild(guild);
+    } catch (err) {
+      logError('RECONCILE_GUILD', err, {
+        guildId: guild.id,
+        guildName: guild.name
+      });
+    }
+  }
+}
+
+// ============================================================
+// 22) READY / STARTUP
+// ============================================================
+client.once(Events.ClientReady, async readyClient => {
+  try {
+    console.log(
+      `[DISCORD] ${BOT_NAME} đã đăng nhập: ${readyClient.user.tag}`
+    );
+
+    await initDb();
+
+    readyClient.user.setActivity(
+      `${BOT_NAME} · /panel`
+    );
+
+    await registerCommands();
+
+    // Tên hiển thị trong từng server.
+    // Đây là nickname server, không thay đổi username của Discord Application.
+    for (const guild of readyClient.guilds.cache.values()) {
+      try {
+        const me =
+          guild.members.me ||
+          await guild.members.fetchMe();
+
+        if (
+          me &&
+          me.displayName !== BOT_NAME &&
+          me.permissions.has(
+            PermissionsBitField.Flags.ChangeNickname
+          )
+        ) {
+          await me.setNickname(
+            BOT_NAME,
+            'Đồng bộ tên hiển thị Voice HDK'
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `[TÊN BOT] Không thể đổi nickname tại ${guild.name}:`,
+          err?.message || err
+        );
+      }
+    }
+
+    await reconcileAllGuilds();
+
+    console.log(
+      `[HỆ THỐNG] ${BOT_NAME} đã sẵn sàng.`
+    );
+  } catch (err) {
+    logError('STARTUP', err);
+
+    // Nếu DB hoặc startup quan trọng thất bại,
+    // không để Render hiển thị tiến trình "sống giả".
+    setTimeout(() => {
+      process.exit(1);
+    }, 1000).unref?.();
+  }
+});
+
+// ============================================================
+// 23) GUILD CREATE
+// ============================================================
+client.on(Events.GuildCreate, async guild => {
+  try {
+    console.log(
+      `[MÁY CHỦ] ${BOT_NAME} đã tham gia ${guild.name} (${guild.id})`
+    );
+  } catch (err) {
+    logError('GUILD_CREATE', err, {
+      guildId: guild?.id
+    });
+  }
+});
+
+// ============================================================
+// 24) CLEANUP MAPS
+// ============================================================
+setInterval(() => {
+  const now = Date.now();
+
+  for (const [key, until] of cooldowns.entries()) {
+    if (until <= now) {
+      cooldowns.delete(key);
+    }
+  }
+
+  for (
+    const [channelId, transfer]
+    of pendingTransfers.entries()
+  ) {
+    if (
+      !transfer ||
+      transfer.expiresAt <= now
+    ) {
+      pendingTransfers.delete(channelId);
+    }
+  }
+}, 60_000).unref?.();
+
+// ============================================================
+// 25) GRACEFUL SHUTDOWN
+// ============================================================
+let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+
+  shuttingDown = true;
+
+  console.log(
+    `[HỆ THỐNG] Nhận ${signal}, đang đóng ${BOT_NAME}...`
+  );
+
+  try {
+    client.destroy();
+  } catch (err) {
+    logError('SHUTDOWN_DISCORD', err);
+  }
+
+  try {
+    await pool.end();
+  } catch (err) {
+    logError('SHUTDOWN_DATABASE', err);
+  }
+
+  process.exit(0);
+}
+
+process.once('SIGTERM', () => {
+  shutdown('SIGTERM').catch(err => {
+    logError('SHUTDOWN', err);
+    process.exit(1);
+  });
+});
+
+process.once('SIGINT', () => {
+  shutdown('SIGINT').catch(err => {
+    logError('SHUTDOWN', err);
+    process.exit(1);
+  });
+});
+
+// ============================================================
+// 26) LOGIN
+// ============================================================
+console.log(
+  `[HỆ THỐNG] Đang khởi động ${BOT_NAME}...`
+);
+
+client.login(TOKEN).catch(err => {
+  logError('LOGIN', err);
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 500).unref?.();
+});
+
+// ============================================================
+// UPTIMEROBOT / RENDER FREE
+// ============================================================
+// URL: https://TEN-SERVICE-CUA-BAN.onrender.com/health
+// Method: GET
