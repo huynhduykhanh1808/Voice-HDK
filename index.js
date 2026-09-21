@@ -18,6 +18,7 @@ const {
   TextInputBuilder,
   TextInputStyle,
   PermissionsBitField,
+  PermissionOverwriteType,
   SlashCommandBuilder
 } = require('discord.js');
 
@@ -25,40 +26,43 @@ const { Pool } = require('pg');
 const http = require('http');
 
 const BOT_NAME = 'Voice HDK';
-const BOT_VERSION = '4.0.0';
+const BOT_VERSION = '5.0.0';
 
-const TOKEN = String(
+const TOKEN = (
   process.env.DISCORD_TOKEN ||
   process.env.TOKEN ||
   ''
 ).trim();
 
-const DATABASE_URL = String(
-  process.env.DATABASE_URL || ''
+const DATABASE_URL = (
+  process.env.DATABASE_URL ||
+  ''
 ).trim();
 
 const PORT = Number(
-  process.env.PORT || 10000
+  process.env.PORT || 8080
 );
 
 const ROOM_PREFIX = '🔊・';
-const APP_COLOR = 0x5865F2;
+const CREATE_CHANNEL_NAME = '🔊・tạo-phòng';
+const CHAT_LOG_CHANNEL_NAME = '💬・nhật-ký-chat';
+const ACTION_LOG_CHANNEL_NAME = '⚙️・nhật-ký-chức-năng';
 
 const SUCCESS_DELETE_MS = 3000;
 const ERROR_DELETE_MS = 4000;
-const ACTION_COOLDOWN_MS = 900;
-const TRANSFER_TIMEOUT_MS = 60_000;
-const SETUP_SESSION_MS = 10 * 60 * 1000;
+const ACTION_COOLDOWN_MS = 1500;
+const TRANSFER_TIMEOUT_MS = 60000;
+const SETUP_TIMEOUT_MS = 10 * 60 * 1000;
 
 if (!TOKEN) {
   throw new Error(
-    'Thiếu DISCORD_TOKEN trong Environment Variables.'
+    'Thiếu DISCORD_TOKEN trong biến môi trường.'
   );
 }
 
 if (!DATABASE_URL) {
   throw new Error(
-    'Thiếu DATABASE_URL trong Environment Variables.'
+    'Thiếu DATABASE_URL trong biến môi trường.'
   );
 }
 
@@ -77,6 +81,7 @@ const pool = new Pool({
 });
 
 const panelLocks = new Map();
+const createLocks = new Map();
 const cooldowns = new Map();
 const selectedMembers = new Map();
 const pendingTransfers = new Map();
@@ -87,7 +92,7 @@ let regionCache = {
   regions: []
 };
 
-const REQUIRED_BOT_PERMISSIONS = [
+const REQUIRED_PERMISSIONS = [
   PermissionsBitField.Flags.ViewChannel,
   PermissionsBitField.Flags.SendMessages,
   PermissionsBitField.Flags.EmbedLinks,
@@ -129,33 +134,34 @@ const PERMISSION_NAMES = new Map([
   ],
   [
     PermissionsBitField.Flags.Connect,
-    'Kết nối voice'
+    'Kết nối Voice'
   ]
 ]);
 
 function logError(
   scope,
-  error,
-  context = {}
+  error
 ) {
-  const code =
-    error?.code ??
-    error?.rawError?.code ??
-    'UNKNOWN';
+  const message =
+    error?.stack ||
+    error?.message ||
+    String(error);
 
   console.error(
-    `[${scope}] code=${code}`,
-    context,
-    error?.stack || error
+    `[${BOT_NAME}] [${scope}]`,
+    message
   );
 }
 
-pool.on('error', error => {
-  logError(
-    'POSTGRES_POOL',
-    error
-  );
-});
+pool.on(
+  'error',
+  error => {
+    logError(
+      'POSTGRES',
+      error
+    );
+  }
+);
 
 client.on(
   Events.Error,
@@ -171,7 +177,7 @@ client.on(
   Events.Warn,
   warning => {
     console.warn(
-      '[DISCORD_WARN]',
+      `[${BOT_NAME}] [DISCORD_WARN]`,
       warning
     );
   }
@@ -195,72 +201,30 @@ process.on(
       error
     );
 
-    setTimeout(
-      () => process.exit(1),
-      500
-    ).unref?.();
+    process.exit(1);
   }
 );
 
 const healthServer = http.createServer(
   (req, res) => {
-    const pathname =
-      String(req.url || '/')
-        .split('?')[0];
-
     if (
-      req.method !== 'GET' &&
-      req.method !== 'HEAD'
-    ) {
-      res.writeHead(
-        405,
-        {
-          'Content-Type':
-            'application/json; charset=utf-8',
-          'Cache-Control':
-            'no-store'
-        }
-      );
-
-      return res.end(
-        JSON.stringify({
-          ok: false,
-          error: 'Method Not Allowed'
-        })
-      );
-    }
-
-    if (
-      pathname !== '/' &&
-      pathname !== '/health'
+      req.url !== '/' &&
+      req.url !== '/health'
     ) {
       res.writeHead(
         404,
         {
           'Content-Type':
-            'application/json; charset=utf-8',
-          'Cache-Control':
-            'no-store'
+            'text/plain; charset=utf-8'
         }
       );
 
-      return res.end(
-        JSON.stringify({
-          ok: false,
-          error: 'Not Found'
-        })
+      res.end(
+        'Not Found'
       );
-    }
 
-    const body = JSON.stringify({
-      ok: true,
-      service: BOT_NAME,
-      version: BOT_VERSION,
-      discord: client.isReady(),
-      uptime: Math.floor(
-        process.uptime()
-      )
-    });
+      return;
+    }
 
     res.writeHead(
       200,
@@ -272,87 +236,90 @@ const healthServer = http.createServer(
       }
     );
 
-    if (req.method === 'HEAD') {
-      return res.end();
-    }
-
-    return res.end(body);
-  }
-);
-
-healthServer.on(
-  'error',
-  error => {
-    logError(
-      'HEALTH_SERVER',
-      error
-    );
-
-    process.exit(1);
-  }
-);
-
-healthServer.listen(
-  PORT,
-  '0.0.0.0',
-  () => {
-    console.log(
-      `[HEALTH] :${PORT}/health`
+    res.end(
+      JSON.stringify({
+        ok: true,
+        service: BOT_NAME,
+        version: BOT_VERSION
+      })
     );
   }
 );
 
 async function initDatabase() {
-  await pool.query('SELECT 1');
+  await pool.query(
+    'SELECT 1'
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS generators (
-      guild_id BIGINT PRIMARY KEY,
-      category_id BIGINT,
-      generator_id BIGINT,
-      blog_channel_id BIGINT,
-      tracked_text_channel_id BIGINT,
-      setup_channel_id BIGINT,
-      setup_message_id BIGINT,
-      display_name TEXT
+      guild_id BIGINT PRIMARY KEY
     )
   `);
 
   await pool.query(`
     ALTER TABLE generators
-    ADD COLUMN IF NOT EXISTS
-    tracked_text_channel_id BIGINT
+    ADD COLUMN IF NOT EXISTS display_name TEXT
   `);
 
   await pool.query(`
     ALTER TABLE generators
-    ADD COLUMN IF NOT EXISTS
-    setup_channel_id BIGINT
+    ADD COLUMN IF NOT EXISTS button_category_id BIGINT
   `);
 
   await pool.query(`
     ALTER TABLE generators
-    ADD COLUMN IF NOT EXISTS
-    setup_message_id BIGINT
+    ADD COLUMN IF NOT EXISTS blog_category_id BIGINT
   `);
 
   await pool.query(`
     ALTER TABLE generators
-    ADD COLUMN IF NOT EXISTS
-    display_name TEXT
+    ADD COLUMN IF NOT EXISTS create_channel_id BIGINT
   `);
 
   await pool.query(`
     ALTER TABLE generators
-    ALTER COLUMN category_id
-    DROP NOT NULL
-  `).catch(() => {});
+    ADD COLUMN IF NOT EXISTS create_message_id BIGINT
+  `);
 
   await pool.query(`
     ALTER TABLE generators
-    ALTER COLUMN generator_id
-    DROP NOT NULL
-  `).catch(() => {});
+    ADD COLUMN IF NOT EXISTS chat_log_channel_id BIGINT
+  `);
+
+  await pool.query(`
+    ALTER TABLE generators
+    ADD COLUMN IF NOT EXISTS action_log_channel_id BIGINT
+  `);
+
+  await pool.query(`
+    ALTER TABLE generators
+    ADD COLUMN IF NOT EXISTS tracked_text_channel_id BIGINT
+  `);
+
+  await pool.query(`
+    ALTER TABLE generators
+    ADD COLUMN IF NOT EXISTS installed_at TIMESTAMPTZ
+  `);
+
+  await pool.query(`
+    ALTER TABLE generators
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ
+  `);
+
+  await pool.query(`
+    ALTER TABLE generators
+    ALTER COLUMN category_id DROP NOT NULL
+  `).catch(
+    () => {}
+  );
+
+  await pool.query(`
+    ALTER TABLE generators
+    ALTER COLUMN generator_id DROP NOT NULL
+  `).catch(
+    () => {}
+  );
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS rooms (
@@ -361,116 +328,150 @@ async function initDatabase() {
       owner_id BIGINT NOT NULL,
       category_id BIGINT,
       control_message_id BIGINT,
-      created_at TIMESTAMPTZ
-        NOT NULL
-        DEFAULT NOW()
+      created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
 
   await pool.query(`
     ALTER TABLE rooms
-    ADD COLUMN IF NOT EXISTS
-    control_message_id BIGINT
+    ADD COLUMN IF NOT EXISTS control_message_id BIGINT
   `);
 
   await pool.query(`
     ALTER TABLE rooms
-    ADD COLUMN IF NOT EXISTS
-    created_at TIMESTAMPTZ
-    DEFAULT NOW()
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+  `);
+
+  await pool.query(`
+    DELETE FROM rooms a
+    USING rooms b
+    WHERE
+      a.guild_id = b.guild_id
+      AND a.owner_id = b.owner_id
+      AND a.channel_id < b.channel_id
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS
+    rooms_one_owner_per_guild
+    ON rooms(guild_id, owner_id)
   `);
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS
-    rooms_guild_owner_idx
-    ON rooms(guild_id, owner_id)
+    rooms_guild_idx
+    ON rooms(guild_id)
   `);
 
   console.log(
-    '[DATABASE] PostgreSQL sẵn sàng.'
+    `[${BOT_NAME}] PostgreSQL sẵn sàng.`
   );
 }
 
 async function getGenerator(
   guildId
 ) {
-  const result = await pool.query(
-    `
-      SELECT *
-      FROM generators
-      WHERE guild_id=$1
-      LIMIT 1
-    `,
-    [guildId]
-  );
+  const result =
+    await pool.query(
+      `
+        SELECT *
+        FROM generators
+        WHERE guild_id = $1
+        LIMIT 1
+      `,
+      [
+        guildId
+      ]
+    );
 
-  return result.rows[0] || null;
+  return (
+    result.rows[0] ||
+    null
+  );
 }
 
 async function saveGenerator({
   guildId,
-  categoryId,
-  generatorId = null,
-  blogChannelId = null,
-  trackedTextChannelId = null,
-  setupChannelId,
-  setupMessageId,
-  displayName
+  displayName,
+  buttonCategoryId,
+  blogCategoryId,
+  createChannelId,
+  createMessageId,
+  chatLogChannelId,
+  actionLogChannelId
 }) {
+  const result =
+    await pool.query(
+      `
+        INSERT INTO generators (
+          guild_id,
+          display_name,
+          button_category_id,
+          blog_category_id,
+          create_channel_id,
+          create_message_id,
+          chat_log_channel_id,
+          action_log_channel_id,
+          installed_at,
+          updated_at
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5,
+          $6,
+          $7,
+          $8,
+          NOW(),
+          NOW()
+        )
+        ON CONFLICT (guild_id)
+        DO UPDATE SET
+          display_name =
+            EXCLUDED.display_name,
+          button_category_id =
+            EXCLUDED.button_category_id,
+          blog_category_id =
+            EXCLUDED.blog_category_id,
+          create_channel_id =
+            EXCLUDED.create_channel_id,
+          create_message_id =
+            EXCLUDED.create_message_id,
+          chat_log_channel_id =
+            EXCLUDED.chat_log_channel_id,
+          action_log_channel_id =
+            EXCLUDED.action_log_channel_id,
+          updated_at =
+            NOW()
+        RETURNING *
+      `,
+      [
+        guildId,
+        displayName,
+        buttonCategoryId,
+        blogCategoryId,
+        createChannelId,
+        createMessageId,
+        chatLogChannelId,
+        actionLogChannelId
+      ]
+    );
+
+  return result.rows[0];
+}
+
+async function deleteGenerator(
+  guildId
+) {
   await pool.query(
     `
-      INSERT INTO generators (
-        guild_id,
-        category_id,
-        generator_id,
-        blog_channel_id,
-        tracked_text_channel_id,
-        setup_channel_id,
-        setup_message_id,
-        display_name
-      )
-      VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8
-      )
-
-      ON CONFLICT(guild_id)
-      DO UPDATE SET
-        category_id =
-          EXCLUDED.category_id,
-
-        generator_id =
-          EXCLUDED.generator_id,
-
-        blog_channel_id =
-          COALESCE(
-            EXCLUDED.blog_channel_id,
-            generators.blog_channel_id
-          ),
-
-        tracked_text_channel_id =
-          COALESCE(
-            EXCLUDED.tracked_text_channel_id,
-            generators.tracked_text_channel_id
-          ),
-
-        setup_channel_id =
-          EXCLUDED.setup_channel_id,
-
-        setup_message_id =
-          EXCLUDED.setup_message_id,
-
-        display_name =
-          EXCLUDED.display_name
+      DELETE FROM generators
+      WHERE guild_id = $1
     `,
     [
-      guildId,
-      categoryId,
-      generatorId,
-      blogChannelId,
-      trackedTextChannelId,
-      setupChannelId,
-      setupMessageId,
-      displayName
+      guildId
     ]
   );
 }
@@ -482,8 +483,10 @@ async function setTrackedTextChannel(
   await pool.query(
     `
       UPDATE generators
-      SET tracked_text_channel_id=$1
-      WHERE guild_id=$2
+      SET
+        tracked_text_channel_id = $1,
+        updated_at = NOW()
+      WHERE guild_id = $2
     `,
     [
       channelId,
@@ -495,39 +498,67 @@ async function setTrackedTextChannel(
 async function getRoom(
   channelId
 ) {
-  const result = await pool.query(
-    `
-      SELECT *
-      FROM rooms
-      WHERE channel_id=$1
-      LIMIT 1
-    `,
-    [channelId]
-  );
+  const result =
+    await pool.query(
+      `
+        SELECT *
+        FROM rooms
+        WHERE channel_id = $1
+        LIMIT 1
+      `,
+      [
+        channelId
+      ]
+    );
 
-  return result.rows[0] || null;
+  return (
+    result.rows[0] ||
+    null
+  );
 }
 
 async function getOwnedRoom(
   guildId,
   ownerId
 ) {
-  const result = await pool.query(
-    `
-      SELECT *
-      FROM rooms
-      WHERE guild_id=$1
-        AND owner_id=$2
-      ORDER BY created_at DESC
-      LIMIT 1
-    `,
-    [
-      guildId,
-      ownerId
-    ]
-  );
+  const result =
+    await pool.query(
+      `
+        SELECT *
+        FROM rooms
+        WHERE
+          guild_id = $1
+          AND owner_id = $2
+        LIMIT 1
+      `,
+      [
+        guildId,
+        ownerId
+      ]
+    );
 
-  return result.rows[0] || null;
+  return (
+    result.rows[0] ||
+    null
+  );
+}
+
+async function getGuildRooms(
+  guildId
+) {
+  const result =
+    await pool.query(
+      `
+        SELECT *
+        FROM rooms
+        WHERE guild_id = $1
+      `,
+      [
+        guildId
+      ]
+    );
+
+  return result.rows;
 }
 
 async function saveRoom({
@@ -535,43 +566,49 @@ async function saveRoom({
   channelId,
   ownerId,
   categoryId,
-  controlMessageId = null
+  controlMessageId = null,
+  dbClient = pool
 }) {
-  await pool.query(
-    `
-      INSERT INTO rooms (
-        guild_id,
-        channel_id,
-        owner_id,
-        category_id,
-        control_message_id
-      )
-      VALUES (
-        $1,$2,$3,$4,$5
-      )
+  const result =
+    await dbClient.query(
+      `
+        INSERT INTO rooms (
+          guild_id,
+          channel_id,
+          owner_id,
+          category_id,
+          control_message_id
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5
+        )
+        ON CONFLICT (channel_id)
+        DO UPDATE SET
+          owner_id =
+            EXCLUDED.owner_id,
+          category_id =
+            EXCLUDED.category_id,
+          control_message_id =
+            COALESCE(
+              EXCLUDED.control_message_id,
+              rooms.control_message_id
+            )
+        RETURNING *
+      `,
+      [
+        guildId,
+        channelId,
+        ownerId,
+        categoryId,
+        controlMessageId
+      ]
+    );
 
-      ON CONFLICT(channel_id)
-      DO UPDATE SET
-        owner_id =
-          EXCLUDED.owner_id,
-
-        category_id =
-          EXCLUDED.category_id,
-
-        control_message_id =
-          COALESCE(
-            EXCLUDED.control_message_id,
-            rooms.control_message_id
-          )
-    `,
-    [
-      guildId,
-      channelId,
-      ownerId,
-      categoryId,
-      controlMessageId
-    ]
-  );
+  return result.rows[0];
 }
 
 async function setControlMessage(
@@ -581,8 +618,8 @@ async function setControlMessage(
   await pool.query(
     `
       UPDATE rooms
-      SET control_message_id=$1
-      WHERE channel_id=$2
+      SET control_message_id = $1
+      WHERE channel_id = $2
     `,
     [
       messageId,
@@ -593,118 +630,120 @@ async function setControlMessage(
 
 async function updateRoomOwner(
   channelId,
-  oldOwnerId,
-  newOwnerId
+  ownerId
 ) {
-  const result = await pool.query(
-    `
-      UPDATE rooms
-      SET owner_id=$1
-      WHERE channel_id=$2
-        AND owner_id=$3
-      RETURNING *
-    `,
-    [
-      newOwnerId,
-      channelId,
-      oldOwnerId
-    ]
-  );
+  const result =
+    await pool.query(
+      `
+        UPDATE rooms
+        SET owner_id = $1
+        WHERE channel_id = $2
+        RETURNING *
+      `,
+      [
+        ownerId,
+        channelId
+      ]
+    );
 
-  return result.rows[0] || null;
+  return (
+    result.rows[0] ||
+    null
+  );
 }
 
 async function deleteRoomRecord(
   channelId
 ) {
-  clearSelectedMember(
-    channelId
-  );
-
-  clearPendingTransfer(
-    channelId
-  );
-
   await pool.query(
     `
       DELETE FROM rooms
-      WHERE channel_id=$1
+      WHERE channel_id = $1
     `,
-    [channelId]
+    [
+      channelId
+    ]
   );
 }
 
-function isSnowflake(value) {
-  return /^\d{17,20}$/.test(
-    String(value || '')
-  );
-}
-
-function safeDisplayName(
-  value,
-  maxLength = 32
+function isSnowflake(
+  value
 ) {
-  const cleaned = String(
+  return (
+    typeof value === 'string' &&
+    /^\d{16,22}$/.test(value)
+  );
+}
+
+function cleanDisplayName(
+  value
+) {
+  return String(
     value || ''
   )
-    .replace(/[`*_~|]/g, '')
-    .replace(/\r?\n/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .replace(
+      /[\r\n\t`]/g,
+      ' '
+    )
+    .replace(
+      /\s+/g,
+      ' '
+    )
+    .trim()
+    .slice(
+      0,
+      50
+    );
+}
 
-  if (!cleaned) {
-    return 'Máy chủ';
-  }
+function cleanRoomName(
+  value
+) {
+  let name =
+    String(
+      value || ''
+    )
+      .replace(
+        /[\r\n\t]/g,
+        ' '
+      )
+      .replace(
+        /\s+/g,
+        ' '
+      )
+      .trim();
 
   if (
-    cleaned.length <=
-    maxLength
+    name.startsWith(
+      ROOM_PREFIX
+    )
   ) {
-    return cleaned;
+    name =
+      name.slice(
+        ROOM_PREFIX.length
+      ).trim();
   }
 
-  return (
-    cleaned.slice(
+  name =
+    name.slice(
       0,
-      Math.max(
-        1,
-        maxLength - 1
-      )
-    ) + '…'
+      80
+    );
+
+  return (
+    name ||
+    'Phòng thoại'
   );
 }
 
 function safeMemberName(
   member
 ) {
-  return safeDisplayName(
+  return cleanDisplayName(
     member?.displayName ||
     member?.user?.globalName ||
     member?.user?.username ||
-    'Thành viên',
-    24
-  );
-}
-
-function cleanRoomName(
-  value
-) {
-  const cleaned = String(
-    value || ''
-  )
-    .replace(/\r?\n/g, ' ')
-    .replace(/\s+/g, ' ')
-    .replace(/^🔊・/, '')
-    .replace(/[\/\\#:@`]/g, '')
-    .trim();
-
-  if (!cleaned) {
-    return 'Phòng riêng';
-  }
-
-  return cleaned.slice(
-    0,
-    80
+    'Thành viên'
   );
 }
 
@@ -717,174 +756,180 @@ function vietnamTime(
       {
         timeZone:
           'Asia/Ho_Chi_Minh',
-        hour12: false,
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        day: '2-digit',
-        month: '2-digit',
-        year: 'numeric'
+        hour:
+          '2-digit',
+        minute:
+          '2-digit',
+        second:
+          '2-digit',
+        day:
+          '2-digit',
+        month:
+          '2-digit',
+        year:
+          'numeric',
+        hour12:
+          false
       }
-    ).formatToParts(date);
+    ).formatToParts(
+      date
+    );
 
-  const get = type =>
-    parts.find(
-      item =>
-        item.type === type
-    )?.value || '';
+  const values =
+    Object.fromEntries(
+      parts.map(
+        part => [
+          part.type,
+          part.value
+        ]
+      )
+    );
 
   return (
-    `${get('hour')}:` +
-    `${get('minute')}:` +
-    `${get('second')} ` +
-    `${get('day')}/` +
-    `${get('month')}/` +
-    `${get('year')}`
+    `${values.hour}:` +
+    `${values.minute}:` +
+    `${values.second} ` +
+    `${values.day}/` +
+    `${values.month}/` +
+    `${values.year}`
   );
 }
 
-function getRoomState(
-  channel
+function relativeTimestamp(
+  timeMs
 ) {
-  const everyone =
-    channel.permissionOverwrites
-      .cache
-      .get(
-        channel.guild.roles
-          .everyone.id
-      );
+  return (
+    `<t:${Math.floor(
+      timeMs / 1000
+    )}:R>`
+  );
+}
 
-  return {
-    locked: Boolean(
-      everyone?.deny.has(
-        PermissionsBitField
-          .Flags
-          .Connect
-      )
-    ),
-
-    hidden: Boolean(
-      everyone?.deny.has(
-        PermissionsBitField
-          .Flags
-          .ViewChannel
-      )
-    )
-  };
+function permissionNames(
+  permissions
+) {
+  return permissions.map(
+    permission =>
+      PERMISSION_NAMES.get(
+        permission
+      ) ||
+      String(permission)
+  );
+}
+function selectedMemberKey(
+  guildId,
+  channelId,
+  ownerId
+) {
+  return (
+    `${guildId}:` +
+    `${channelId}:` +
+    `${ownerId}`
+  );
 }
 
 function setSelectedMember(
+  guildId,
   channelId,
   ownerId,
-  targetId
+  memberId
 ) {
-  selectedMembers.set(
-    String(channelId),
-    {
-      ownerId:
-        String(ownerId),
+  const key =
+    selectedMemberKey(
+      guildId,
+      channelId,
+      ownerId
+    );
 
-      targetId:
-        String(targetId)
+  selectedMembers.set(
+    key,
+    {
+      memberId,
+      expiresAt:
+        Date.now() +
+        10 * 60 * 1000
     }
   );
 }
 
-function getSelectedMember(
+function getSelectedMemberId(
+  guildId,
   channelId,
   ownerId
 ) {
   const key =
-    String(channelId);
+    selectedMemberKey(
+      guildId,
+      channelId,
+      ownerId
+    );
 
-  const selected =
-    selectedMembers.get(key);
+  const data =
+    selectedMembers.get(
+      key
+    );
 
-  if (!selected) {
+  if (!data) {
     return null;
   }
 
   if (
-    String(selected.ownerId) !==
-    String(ownerId)
+    data.expiresAt <=
+    Date.now()
   ) {
-    selectedMembers.delete(key);
+    selectedMembers.delete(
+      key
+    );
+
     return null;
   }
 
-  return selected.targetId;
+  return data.memberId;
 }
 
 function clearSelectedMember(
-  channelId
+  guildId,
+  channelId,
+  ownerId
 ) {
   selectedMembers.delete(
-    String(channelId)
+    selectedMemberKey(
+      guildId,
+      channelId,
+      ownerId
+    )
   );
 }
 
-function clearPendingTransfer(
+function clearSelectionsForChannel(
+  guildId,
   channelId
 ) {
-  const key =
-    String(channelId);
+  const prefix =
+    `${guildId}:${channelId}:`;
 
-  const pending =
-    pendingTransfers.get(key);
-
-  if (pending?.timer) {
-    clearTimeout(
-      pending.timer
-    );
+  for (
+    const key
+    of selectedMembers.keys()
+  ) {
+    if (
+      key.startsWith(
+        prefix
+      )
+    ) {
+      selectedMembers.delete(
+        key
+      );
+    }
   }
-
-  pendingTransfers.delete(key);
-}
-
-function relativeTimestamp(
-  timestamp
-) {
-  return (
-    `<t:${Math.floor(
-      timestamp / 1000
-    )}:R>`
-  );
 }
 
 function setupSessionKey(
   guildId,
   userId
 ) {
-  return `${guildId}:${userId}`;
-}
-
-function setSetupSession(
-  guildId,
-  userId,
-  data = {}
-) {
-  setupSessions.set(
-    setupSessionKey(
-      guildId,
-      userId
-    ),
-    {
-      guildId:
-        String(guildId),
-
-      userId:
-        String(userId),
-
-      channelId:
-        data.channelId || null,
-
-      displayName:
-        data.displayName || null,
-
-      expiresAt:
-        Date.now() +
-        SETUP_SESSION_MS
-    }
+  return (
+    `${guildId}:${userId}`
   );
 }
 
@@ -899,24 +944,64 @@ function getSetupSession(
     );
 
   const session =
-    setupSessions.get(key);
+    setupSessions.get(
+      key
+    );
 
   if (!session) {
     return null;
   }
 
   if (
-    session.expiresAt <
+    session.expiresAt <=
     Date.now()
   ) {
-    setupSessions.delete(key);
+    setupSessions.delete(
+      key
+    );
+
     return null;
   }
 
   return session;
 }
 
-function clearSetupSession(
+function saveSetupSession(
+  guildId,
+  userId,
+  data = {}
+) {
+  const key =
+    setupSessionKey(
+      guildId,
+      userId
+    );
+
+  const old =
+    getSetupSession(
+      guildId,
+      userId
+    ) || {};
+
+  const session = {
+    ...old,
+    ...data,
+    guildId,
+    userId,
+    expiresAt:
+      Date.now() +
+      SETUP_TIMEOUT_MS
+  };
+
+  setupSessions.set(
+    key,
+    session
+  );
+
+  return session;
+}
+
+function deleteSetupSession(
   guildId,
   userId
 ) {
@@ -928,53 +1013,171 @@ function clearSetupSession(
   );
 }
 
-function useCooldown(
+function transferKey(
+  channelId
+) {
+  return String(
+    channelId
+  );
+}
+
+function getPendingTransfer(
+  channelId
+) {
+  const key =
+    transferKey(
+      channelId
+    );
+
+  const transfer =
+    pendingTransfers.get(
+      key
+    );
+
+  if (!transfer) {
+    return null;
+  }
+
+  if (
+    transfer.expiresAt <=
+    Date.now()
+  ) {
+    pendingTransfers.delete(
+      key
+    );
+
+    return null;
+  }
+
+  return transfer;
+}
+
+function clearPendingTransfer(
+  channelId
+) {
+  const key =
+    transferKey(
+      channelId
+    );
+
+  const transfer =
+    pendingTransfers.get(
+      key
+    );
+
+  if (
+    transfer?.timer
+  ) {
+    clearTimeout(
+      transfer.timer
+    );
+  }
+
+  pendingTransfers.delete(
+    key
+  );
+}
+
+function cooldownKey(
   userId,
   action
 ) {
+  return (
+    `${userId}:${action}`
+  );
+}
+
+function useCooldown(
+  userId,
+  action,
+  duration =
+    ACTION_COOLDOWN_MS
+) {
   const key =
-    `${userId}:${action}`;
+    cooldownKey(
+      userId,
+      action
+    );
 
   const now =
     Date.now();
 
   const until =
-    cooldowns.get(key) || 0;
+    cooldowns.get(
+      key
+    ) || 0;
 
-  if (until > now) {
-    return false;
+  if (
+    until > now
+  ) {
+    return (
+      until - now
+    );
   }
 
   cooldowns.set(
     key,
-    now +
-    ACTION_COOLDOWN_MS
+    now + duration
   );
 
-  return true;
+  const timer =
+    setTimeout(
+      () => {
+        if (
+          cooldowns.get(
+            key
+          ) <=
+          Date.now()
+        ) {
+          cooldowns.delete(
+            key
+          );
+        }
+      },
+      duration + 1000
+    );
+
+  timer.unref?.();
+
+  return 0;
 }
 
-async function withPanelLock(
-  channelId,
+async function withLock(
+  map,
+  key,
   task
 ) {
-  const key =
-    String(channelId);
+  const lockKey =
+    String(key);
 
   const previous =
-    panelLocks.get(key) ||
+    map.get(
+      lockKey
+    ) ||
     Promise.resolve();
 
   let release;
 
   const current =
-    new Promise(resolve => {
-      release = resolve;
-    });
+    new Promise(
+      resolve => {
+        release =
+          resolve;
+      }
+    );
 
-  panelLocks.set(
-    key,
-    current
+  const chain =
+    previous
+      .catch(
+        () => {}
+      )
+      .then(
+        () => current
+      );
+
+  map.set(
+    lockKey,
+    chain
   );
 
   await previous.catch(
@@ -987,223 +1190,269 @@ async function withPanelLock(
     release();
 
     if (
-      panelLocks.get(key) ===
-      current
+      map.get(
+        lockKey
+      ) === chain
     ) {
-      panelLocks.delete(key);
+      map.delete(
+        lockKey
+      );
     }
   }
 }
 
-function getMissingPermissions(
-  guild,
-  channel = null
+function withPanelLock(
+  channelId,
+  task
 ) {
-  const me =
-    guild.members.me;
+  return withLock(
+    panelLocks,
+    channelId,
+    task
+  );
+}
 
-  if (!me) {
+function withCreateLock(
+  guildId,
+  ownerId,
+  task
+) {
+  return withLock(
+    createLocks,
+    `${guildId}:${ownerId}`,
+    task
+  );
+}
+
+function missingPermissions(
+  permissions
+) {
+  if (!permissions) {
     return [
-      ...REQUIRED_BOT_PERMISSIONS
+      ...REQUIRED_PERMISSIONS
     ];
   }
 
-  const permissions =
-    channel
-      ? channel.permissionsFor(me)
-      : me.permissions;
-
-  return REQUIRED_BOT_PERMISSIONS
-    .filter(
+  return (
+    REQUIRED_PERMISSIONS.filter(
       permission =>
-        !permissions?.has(
+        !permissions.has(
           permission
         )
-    );
-}
-
-function permissionNames(
-  permissions
-) {
-  return permissions.map(
-    permission =>
-      PERMISSION_NAMES.get(
-        permission
-      ) ||
-      String(permission)
+    )
   );
 }
-async function deleteReplyLater(
-  interaction,
-  delay = SUCCESS_DELETE_MS
+
+async function getBotMember(
+  guild
 ) {
-  const timer = setTimeout(
-    async () => {
-      try {
-        await interaction.deleteReply();
-      } catch {}
-    },
-    delay
-  );
-
-  timer.unref?.();
-}
-
-async function tempReply(
-  interaction,
-  content,
-  {
-    error = false,
-    delay = null
-  } = {}
-) {
-  const deleteAfter =
-    delay ??
-    (
-      error
-        ? ERROR_DELETE_MS
-        : SUCCESS_DELETE_MS
-    );
-
-  try {
-    if (interaction.deferred) {
-      await interaction.editReply({
-        content,
-        components: []
-      });
-
-      deleteReplyLater(
-        interaction,
-        deleteAfter
-      );
-
-      return;
-    }
-
-    if (interaction.replied) {
-      const message =
-        await interaction.followUp({
-          content,
-          ephemeral: true,
-          fetchReply: true
-        });
-
-      const timer = setTimeout(
-        () => {
-          message
-            .delete()
-            .catch(() => {});
-        },
-        deleteAfter
-      );
-
-      timer.unref?.();
-      return;
-    }
-
-    await interaction.reply({
-      content,
-      ephemeral: true
-    });
-
-    deleteReplyLater(
-      interaction,
-      deleteAfter
-    );
-  } catch (errorReply) {
-    logError(
-      'TEMP_REPLY',
-      errorReply,
-      {
-        interactionId:
-          interaction?.id,
-
-        customId:
-          interaction?.customId
-      }
-    );
+  if (!guild) {
+    return null;
   }
-}
 
-async function tempFollowUp(
-  interaction,
-  content,
-  {
-    error = false,
-    delay = null
-  } = {}
-) {
-  const deleteAfter =
-    delay ??
-    (
-      error
-        ? ERROR_DELETE_MS
-        : SUCCESS_DELETE_MS
-    );
+  if (
+    guild.members.me
+  ) {
+    return guild.members.me;
+  }
 
   try {
-    const message =
-      await interaction.followUp({
-        content,
-        ephemeral: true,
-        fetchReply: true
-      });
-
-    const timer = setTimeout(
-      () => {
-        message
-          .delete()
-          .catch(() => {});
-      },
-      deleteAfter
-    );
-
-    timer.unref?.();
-
-    return message;
-  } catch (errorFollowUp) {
+    return await guild.members.fetchMe();
+  } catch (error) {
     logError(
-      'TEMP_FOLLOWUP',
-      errorFollowUp,
-      {
-        interactionId:
-          interaction?.id,
-
-        customId:
-          interaction?.customId
-      }
+      'FETCH_BOT_MEMBER',
+      error
     );
 
     return null;
   }
 }
 
-async function ensureBotRoomPermissions(
-  channel
+async function getGuildMember(
+  guild,
+  memberId
 ) {
-  const me =
-    channel.guild.members.me ||
-    await channel.guild.members
-      .fetchMe();
+  if (
+    !guild ||
+    !isSnowflake(
+      String(memberId)
+    )
+  ) {
+    return null;
+  }
 
-  if (!me) {
+  const id =
+    String(memberId);
+
+  const cached =
+    guild.members.cache.get(
+      id
+    );
+
+  if (cached) {
+    return cached;
+  }
+
+  try {
+    return await guild.members.fetch(
+      id
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function resolveOverwriteTarget(
+  guild,
+  targetId
+) {
+  if (
+    !guild ||
+    !isSnowflake(
+      String(targetId)
+    )
+  ) {
+    return null;
+  }
+
+  const id =
+    String(targetId);
+
+  const role =
+    guild.roles.cache.get(
+      id
+    );
+
+  if (role) {
+    return {
+      id: role.id,
+      type:
+        PermissionOverwriteType.Role
+    };
+  }
+
+  const member =
+    await getGuildMember(
+      guild,
+      id
+    );
+
+  if (member) {
+    return {
+      id: member.id,
+      type:
+        PermissionOverwriteType.Member
+    };
+  }
+
+  return null;
+}
+
+async function safeEditOverwrite(
+  channel,
+  targetId,
+  permissions,
+  reason
+) {
+  if (
+    !channel?.guild
+  ) {
     throw new Error(
-      'Không tìm thấy thành viên bot trong máy chủ.'
+      'Kênh Discord không hợp lệ.'
     );
   }
 
-  await channel.permissionOverwrites.edit(
-    me.id,
+  const target =
+    await resolveOverwriteTarget(
+      channel.guild,
+      targetId
+    );
+
+  if (!target) {
+    throw new Error(
+      'Không tìm thấy thành viên hoặc vai trò hợp lệ để cập nhật quyền.'
+    );
+  }
+
+  return (
+    channel.permissionOverwrites.edit(
+      target.id,
+      permissions,
+      {
+        type:
+          target.type,
+        reason
+      }
+    )
+  );
+}
+
+async function safeDeleteOverwrite(
+  channel,
+  targetId,
+  reason
+) {
+  if (
+    !channel?.guild ||
+    !isSnowflake(
+      String(targetId)
+    )
+  ) {
+    return false;
+  }
+
+  const overwrite =
+    channel.permissionOverwrites.cache.get(
+      String(targetId)
+    );
+
+  if (!overwrite) {
+    return true;
+  }
+
+  try {
+    await overwrite.delete(
+      reason
+    );
+
+    return true;
+  } catch (error) {
+    logError(
+      'DELETE_OVERWRITE',
+      error
+    );
+
+    return false;
+  }
+}
+
+async function ensureBotRoomPermissions(
+  channel
+) {
+  const botMember =
+    await getBotMember(
+      channel.guild
+    );
+
+  if (!botMember) {
+    throw new Error(
+      'Không tìm thấy tài khoản bot trong server.'
+    );
+  }
+
+  await safeEditOverwrite(
+    channel,
+    botMember.id,
     {
       ViewChannel: true,
       Connect: true,
       SendMessages: true,
-      EmbedLinks: true,
       ReadMessageHistory: true,
       ManageChannels: true,
       ManageRoles: true,
       MoveMembers: true
-    }
+    },
+    `${BOT_NAME}: bảo đảm quyền quản lý phòng`
   );
 }
 
@@ -1211,23 +1460,26 @@ async function grantOwnerPermissions(
   channel,
   ownerId
 ) {
-  if (!isSnowflake(ownerId)) {
-    throw new TypeError(
-      'ID chủ phòng không hợp lệ.'
+  const member =
+    await getGuildMember(
+      channel.guild,
+      ownerId
+    );
+
+  if (!member) {
+    throw new Error(
+      'Không tìm thấy chủ phòng trong server.'
     );
   }
 
-  await channel.permissionOverwrites.edit(
-    ownerId,
+  await safeEditOverwrite(
+    channel,
+    member.id,
     {
       ViewChannel: true,
-      Connect: true,
-      Speak: true,
-      Stream: true,
-      UseVAD: true,
-      SendMessages: true,
-      ReadMessageHistory: true
-    }
+      Connect: true
+    },
+    `${BOT_NAME}: cấp quyền chủ phòng`
   );
 }
 
@@ -1235,38 +1487,37 @@ async function removeOwnerPermissions(
   channel,
   ownerId
 ) {
-  if (!isSnowflake(ownerId)) {
-    return;
+  if (
+    !isSnowflake(
+      String(ownerId)
+    )
+  ) {
+    return false;
   }
 
-  await channel.permissionOverwrites
-    .delete(ownerId)
-    .catch(error => {
-      logError(
-        'REMOVE_OWNER_PERMISSIONS',
-        error,
-        {
-          channelId:
-            channel.id,
-
-          ownerId
-        }
-      );
-    });
+  return safeDeleteOverwrite(
+    channel,
+    String(ownerId),
+    `${BOT_NAME}: thu hồi quyền chủ phòng cũ`
+  );
 }
 
 async function setRoomLocked(
   channel,
   locked
 ) {
-  await channel.permissionOverwrites.edit(
+  await safeEditOverwrite(
+    channel,
     channel.guild.roles.everyone.id,
     {
       Connect:
         locked
           ? false
           : null
-    }
+    },
+    locked
+      ? `${BOT_NAME}: khóa phòng`
+      : `${BOT_NAME}: mở phòng`
   );
 }
 
@@ -1274,14 +1525,18 @@ async function setRoomHidden(
   channel,
   hidden
 ) {
-  await channel.permissionOverwrites.edit(
+  await safeEditOverwrite(
+    channel,
     channel.guild.roles.everyone.id,
     {
       ViewChannel:
         hidden
           ? false
           : null
-    }
+    },
+    hidden
+      ? `${BOT_NAME}: ẩn phòng`
+      : `${BOT_NAME}: hiện phòng`
   );
 }
 
@@ -1291,60 +1546,23 @@ async function inviteMember(
 ) {
   if (
     !member ||
-    !isSnowflake(member.id)
+    member.guild.id !==
+      channel.guild.id
   ) {
     throw new Error(
-      'Thành viên được mời không hợp lệ.'
+      'Thành viên không hợp lệ.'
     );
   }
 
-  if (member.user?.bot) {
-    throw new Error(
-      'Không thể mời bot vào phòng.'
-    );
-  }
-
-  await channel.permissionOverwrites.edit(
+  await safeEditOverwrite(
+    channel,
     member.id,
     {
       ViewChannel: true,
       Connect: true
-    }
+    },
+    `${BOT_NAME}: mời thành viên vào phòng`
   );
-
-  const freshChannel =
-    await channel.guild.channels
-      .fetch(channel.id);
-
-  if (!freshChannel) {
-    throw new Error(
-      'Không thể xác minh phòng sau khi mời.'
-    );
-  }
-
-  const overwrite =
-    freshChannel.permissionOverwrites
-      .cache
-      .get(member.id);
-
-  const canView =
-    overwrite?.allow.has(
-      PermissionsBitField.Flags.ViewChannel
-    );
-
-  const canConnect =
-    overwrite?.allow.has(
-      PermissionsBitField.Flags.Connect
-    );
-
-  if (
-    !canView ||
-    !canConnect
-  ) {
-    throw new Error(
-      'Discord chưa áp dụng đầy đủ quyền mời.'
-    );
-  }
 }
 
 async function denyMember(
@@ -1353,27 +1571,30 @@ async function denyMember(
 ) {
   if (
     !member ||
-    !isSnowflake(member.id)
+    member.guild.id !==
+      channel.guild.id
   ) {
     throw new Error(
-      'Thành viên cần cấm không hợp lệ.'
+      'Thành viên không hợp lệ.'
     );
   }
 
-  await channel.permissionOverwrites.edit(
+  await safeEditOverwrite(
+    channel,
     member.id,
     {
       ViewChannel: false,
       Connect: false
-    }
+    },
+    `${BOT_NAME}: cấm thành viên khỏi phòng`
   );
 
   if (
-    member.voice.channelId ===
+    member.voice?.channelId ===
     channel.id
   ) {
     await member.voice.disconnect(
-      `Bị cấm khỏi ${channel.name}`
+      `${BOT_NAME}: thành viên bị cấm khỏi phòng`
     );
   }
 }
@@ -1384,31 +1605,89 @@ async function kickMember(
 ) {
   if (
     !member ||
-    !isSnowflake(member.id)
+    member.guild.id !==
+      channel.guild.id
   ) {
     throw new Error(
-      'Thành viên cần đuổi không hợp lệ.'
+      'Thành viên không hợp lệ.'
     );
   }
 
   if (
-    member.voice.channelId !==
+    member.voice?.channelId !==
     channel.id
   ) {
     throw new Error(
-      'Thành viên không còn ở trong phòng.'
+      'Thành viên được chọn không còn ở trong phòng này.'
     );
   }
 
   await member.voice.disconnect(
-    `Bị đuổi khỏi ${channel.name}`
+    `${BOT_NAME}: chủ phòng đã đuổi thành viên`
   );
+}
+
+async function clearMemberOverwrites(
+  channel,
+  keepMemberIds = []
+) {
+  const keep =
+    new Set(
+      keepMemberIds.map(
+        id =>
+          String(id)
+      )
+    );
+
+  for (
+    const overwrite
+    of channel.permissionOverwrites.cache.values()
+  ) {
+    if (
+      overwrite.type !==
+      PermissionOverwriteType.Member
+    ) {
+      continue;
+    }
+
+    if (
+      keep.has(
+        overwrite.id
+      )
+    ) {
+      continue;
+    }
+
+    try {
+      await overwrite.delete(
+        `${BOT_NAME}: đặt lại quyền thành viên`
+      );
+    } catch (error) {
+      logError(
+        'RESET_MEMBER_OVERWRITE',
+        error
+      );
+
+      throw error;
+    }
+  }
 }
 
 async function resetRoom(
   channel,
   ownerId
 ) {
+  const botMember =
+    await getBotMember(
+      channel.guild
+    );
+
+  if (!botMember) {
+    throw new Error(
+      'Không tìm thấy bot trong server.'
+    );
+  }
+
   await setRoomLocked(
     channel,
     false
@@ -1419,65 +1698,234 @@ async function resetRoom(
     false
   );
 
-  await channel.setUserLimit(0);
-  await channel.setRTCRegion(null);
+  await channel.setUserLimit(
+    0,
+    `${BOT_NAME}: đặt lại giới hạn`
+  );
 
-  const protectedIds =
-    new Set([
-      String(
-        channel.guild.roles.everyone.id
-      ),
+  await channel.setRTCRegion(
+    null,
+    `${BOT_NAME}: đặt lại khu vực tự động`
+  );
+
+  await clearMemberOverwrites(
+    channel,
+    [
       String(ownerId),
-      String(client.user.id)
-    ]);
-
-  const overwrites = [
-    ...channel.permissionOverwrites
-      .cache.values()
-  ];
-
-  for (
-    const overwrite
-    of overwrites
-  ) {
-    if (
-      protectedIds.has(
-        String(overwrite.id)
-      )
-    ) {
-      continue;
-    }
-
-    try {
-      await channel.permissionOverwrites
-        .delete(overwrite.id);
-    } catch (error) {
-      logError(
-        'RESET_OVERWRITE',
-        error,
-        {
-          channelId:
-            channel.id,
-
-          overwriteId:
-            overwrite.id
-        }
-      );
-    }
-  }
+      botMember.id
+    ]
+  );
 
   await grantOwnerPermissions(
     channel,
-    ownerId
+    String(ownerId)
   );
 
-  clearSelectedMember(
-    channel.id
+  await ensureBotRoomPermissions(
+    channel
   );
+}
 
-  clearPendingTransfer(
-    channel.id
-  );
+function deleteReplyLater(
+  interaction,
+  delay
+) {
+  const timer =
+    setTimeout(
+      async () => {
+        try {
+          if (
+            interaction.deferred ||
+            interaction.replied
+          ) {
+            await interaction.deleteReply();
+          }
+        } catch {
+        }
+      },
+      delay
+    );
+
+  timer.unref?.();
+}
+
+function deleteMessageLater(
+  message,
+  delay
+) {
+  if (!message) {
+    return;
+  }
+
+  const timer =
+    setTimeout(
+      async () => {
+        try {
+          await message.delete();
+        } catch {
+        }
+      },
+      delay
+    );
+
+  timer.unref?.();
+}
+
+async function tempReply(
+  interaction,
+  content,
+  {
+    error = false
+  } = {}
+) {
+  const delay =
+    error
+      ? ERROR_DELETE_MS
+      : SUCCESS_DELETE_MS;
+
+  const payload = {
+    content,
+    ephemeral: true
+  };
+
+  try {
+    if (
+      interaction.deferred
+    ) {
+      await interaction.editReply({
+        content
+      });
+
+      deleteReplyLater(
+        interaction,
+        delay
+      );
+
+      return null;
+    }
+
+    if (
+      interaction.replied
+    ) {
+      const message =
+        await interaction.followUp({
+          ...payload,
+          fetchReply: true
+        });
+
+      deleteMessageLater(
+        message,
+        delay
+      );
+
+      return message;
+    }
+
+    await interaction.reply(
+      payload
+    );
+
+    deleteReplyLater(
+      interaction,
+      delay
+    );
+
+    return null;
+  } catch (errorObject) {
+    logError(
+      'TEMP_REPLY',
+      errorObject
+    );
+
+    return null;
+  }
+}
+
+async function tempFollowUp(
+  interaction,
+  content,
+  {
+    error = false
+  } = {}
+) {
+  const delay =
+    error
+      ? ERROR_DELETE_MS
+      : SUCCESS_DELETE_MS;
+
+  try {
+    const message =
+      await interaction.followUp({
+        content,
+        ephemeral: true,
+        fetchReply: true
+      });
+
+    deleteMessageLater(
+      message,
+      delay
+    );
+
+    return message;
+  } catch (errorObject) {
+    logError(
+      'TEMP_FOLLOWUP',
+      errorObject
+    );
+
+    return null;
+  }
+}
+
+async function safeDeferUpdate(
+  interaction
+) {
+  if (
+    interaction.deferred ||
+    interaction.replied
+  ) {
+    return true;
+  }
+
+  try {
+    await interaction.deferUpdate();
+
+    return true;
+  } catch (error) {
+    logError(
+      'DEFER_UPDATE',
+      error
+    );
+
+    return false;
+  }
+}
+
+async function safeDeferReply(
+  interaction,
+  ephemeral = true
+) {
+  if (
+    interaction.deferred ||
+    interaction.replied
+  ) {
+    return true;
+  }
+
+  try {
+    await interaction.deferReply({
+      ephemeral
+    });
+
+    return true;
+  } catch (error) {
+    logError(
+      'DEFER_REPLY',
+      error
+    );
+
+    return false;
+  }
 }
 
 async function getVoiceRegions(
@@ -1494,158 +1942,1682 @@ async function getVoiceRegions(
     return regionCache.regions;
   }
 
-  const collection =
+  const regions =
     await client.fetchVoiceRegions();
 
-  const regions = [
-    ...collection.values()
-  ]
-    .filter(
-      region =>
-        !region.deprecated
-    )
-    .sort(
-      (a, b) =>
-        String(
-          a.name || a.id
-        ).localeCompare(
-          String(
-            b.name || b.id
-          ),
-          'vi'
-        )
-    );
+  const normalized =
+    regions
+      .map(
+        region => ({
+          id:
+            String(
+              region.id
+            ),
+          name:
+            String(
+              region.name ||
+              region.id
+            ),
+          optimal:
+            Boolean(
+              region.optimal
+            ),
+          deprecated:
+            Boolean(
+              region.deprecated
+            ),
+          custom:
+            Boolean(
+              region.custom
+            )
+        })
+      )
+      .filter(
+        region =>
+          !region.deprecated
+      )
+      .sort(
+        (a, b) => {
+          if (
+            a.optimal !==
+            b.optimal
+          ) {
+            return a.optimal
+              ? -1
+              : 1;
+          }
+
+          return (
+            a.name.localeCompare(
+              b.name,
+              'vi'
+            )
+          );
+        }
+      );
 
   regionCache = {
+    regions:
+      normalized,
     expiresAt:
       now +
-      30 * 60 * 1000,
-
-    regions
+      30 * 60 * 1000
   };
 
-  return regions;
+  return normalized;
 }
 
-function getRegionLabel(
-  channel,
-  regions
+async function validateRegion(
+  regionId
 ) {
-  if (!channel.rtcRegion) {
-    return 'Tự động';
+  if (
+    !regionId ||
+    regionId ===
+      'automatic'
+  ) {
+    return null;
   }
 
-  const region =
+  let regions =
+    await getVoiceRegions();
+
+  let found =
     regions.find(
-      item =>
-        item.id ===
-        channel.rtcRegion
+      region =>
+        region.id ===
+        regionId
     );
 
-  return safeDisplayName(
-    region?.name ||
-    channel.rtcRegion,
-    24
+  if (!found) {
+    regions =
+      await getVoiceRegions(
+        true
+      );
+
+    found =
+      regions.find(
+        region =>
+          region.id ===
+          regionId
+      );
+  }
+
+  return (
+    found ||
+    null
   );
 }
 
-function getPanelColor(
-  locked,
-  hidden
+function getRoomState(
+  channel
 ) {
-  if (
-    locked &&
-    hidden
-  ) {
-    return 0xED4245;
-  }
+  const everyone =
+    channel.permissionOverwrites.cache.get(
+      channel.guild.roles.everyone.id
+    );
 
-  if (
-    locked ||
-    hidden
-  ) {
-    return 0xFEE75C;
-  }
+  const locked =
+    everyone?.deny?.has(
+      PermissionsBitField.Flags.Connect
+    ) || false;
 
-  return 0x57F287;
-}
+  const hidden =
+    everyone?.deny?.has(
+      PermissionsBitField.Flags.ViewChannel
+    ) || false;
 
-function makePanelDashboard({
-  channel,
-  owner,
-  generator,
-  regionLabel
-}) {
-  const {
+  return {
     locked,
     hidden
-  } = getRoomState(channel);
+  };
+}
 
-  const ownerName =
-    safeMemberName(owner)
-      .toUpperCase();
+async function getRoomOwnerMember(
+  room,
+  guild
+) {
+  if (
+    !room ||
+    !guild
+  ) {
+    return null;
+  }
 
-  const memberCount =
+  return getGuildMember(
+    guild,
+    String(
+      room.owner_id
+    )
+  );
+}
+
+async function getSelectedMember(
+  guild,
+  channelId,
+  ownerId
+) {
+  const memberId =
+    getSelectedMemberId(
+      guild.id,
+      channelId,
+      ownerId
+    );
+
+  if (!memberId) {
+    return null;
+  }
+
+  const member =
+    await getGuildMember(
+      guild,
+      memberId
+    );
+
+  if (!member) {
+    clearSelectedMember(
+      guild.id,
+      channelId,
+      ownerId
+    );
+
+    return null;
+  }
+
+  return member;
+}
+
+function canManageSetup(
+  interaction
+) {
+  return Boolean(
+    interaction.memberPermissions?.has(
+      PermissionsBitField.Flags.ManageGuild
+    ) ||
+    interaction.memberPermissions?.has(
+      PermissionsBitField.Flags.Administrator
+    )
+  );
+}
+
+async function validateSetupPermissions(
+  guild,
+  buttonCategory = null,
+  blogCategory = null
+) {
+  const botMember =
+    await getBotMember(
+      guild
+    );
+
+  if (!botMember) {
+    return {
+      ok: false,
+      missing: [
+        'Không tìm thấy bot trong server'
+      ]
+    };
+  }
+
+  const globalMissing =
+    missingPermissions(
+      botMember.permissions
+    );
+
+  const missingNames =
+    permissionNames(
+      globalMissing
+    );
+
+  for (
+    const category
+    of [
+      buttonCategory,
+      blogCategory
+    ]
+  ) {
+    if (!category) {
+      continue;
+    }
+
+    const permissions =
+      category.permissionsFor(
+        botMember
+      );
+
+    const categoryMissing =
+      missingPermissions(
+        permissions
+      );
+
+    for (
+      const name
+      of permissionNames(
+        categoryMissing
+      )
+    ) {
+      const item =
+        `${name} (${category.name})`;
+
+      if (
+        !missingNames.includes(
+          item
+        )
+      ) {
+        missingNames.push(
+          item
+        );
+      }
+    }
+  }
+
+  return {
+    ok:
+      missingNames.length === 0,
+    missing:
+      missingNames
+  };
+}
+function buildSetupPanel(
+  session
+) {
+  const displayName =
+    cleanDisplayName(
+      session?.displayName
+    );
+
+  const buttonCategoryId =
+    session?.buttonCategoryId
+      ? String(
+          session.buttonCategoryId
+        )
+      : null;
+
+  const blogCategoryId =
+    session?.blogCategoryId
+      ? String(
+          session.blogCategoryId
+        )
+      : null;
+
+  const ready =
+    Boolean(
+      displayName &&
+      buttonCategoryId &&
+      blogCategoryId
+    );
+
+  const embed =
+    new EmbedBuilder()
+      .setTitle(
+        '⚙️ Thiết lập Voice HDK'
+      )
+      .setDescription(
+        [
+          '🏷️ **Tên Server**',
+          displayName ||
+            'Chưa đặt',
+          '',
+          '📁 **Danh mục đặt nút**',
+          buttonCategoryId
+            ? `<#${buttonCategoryId}>`
+            : 'Chưa chọn',
+          '',
+          '📁 **Danh mục đặt Blog**',
+          blogCategoryId
+            ? `<#${blogCategoryId}>`
+            : 'Chưa chọn'
+        ].join(
+          '\n'
+        )
+      )
+      .setFooter({
+        text:
+          `${BOT_NAME} • Thiết lập hệ thống`
+      });
+
+  const nameRow =
+    new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId(
+            'setup_name'
+          )
+          .setLabel(
+            'Đặt tên Server'
+          )
+          .setEmoji(
+            '🏷️'
+          )
+          .setStyle(
+            ButtonStyle.Secondary
+          )
+      );
+
+  const buttonCategoryRow =
+    new ActionRowBuilder()
+      .addComponents(
+        new ChannelSelectMenuBuilder()
+          .setCustomId(
+            'setup_button_category'
+          )
+          .setPlaceholder(
+            '📁 Chọn danh mục đặt nút'
+          )
+          .setChannelTypes(
+            ChannelType.GuildCategory
+          )
+          .setMinValues(
+            1
+          )
+          .setMaxValues(
+            1
+          )
+      );
+
+  const blogCategoryRow =
+    new ActionRowBuilder()
+      .addComponents(
+        new ChannelSelectMenuBuilder()
+          .setCustomId(
+            'setup_blog_category'
+          )
+          .setPlaceholder(
+            '📁 Chọn danh mục đặt Blog'
+          )
+          .setChannelTypes(
+            ChannelType.GuildCategory
+          )
+          .setMinValues(
+            1
+          )
+          .setMaxValues(
+            1
+          )
+      );
+
+  const installRow =
+    new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId(
+            'setup_install'
+          )
+          .setLabel(
+            'Cài đặt'
+          )
+          .setEmoji(
+            '✅'
+          )
+          .setStyle(
+            ButtonStyle.Success
+          )
+          .setDisabled(
+            !ready
+          )
+      );
+
+  return {
+    embeds: [
+      embed
+    ],
+    components: [
+      nameRow,
+      buttonCategoryRow,
+      blogCategoryRow,
+      installRow
+    ]
+  };
+}
+
+function buildReinstallPanel() {
+  const embed =
+    new EmbedBuilder()
+      .setTitle(
+        '⚠️ CÀI ĐẶT LẠI VOICE HDK'
+      )
+      .setDescription(
+        [
+          'Server này đã được cài đặt Voice HDK.',
+          '',
+          'Tiếp tục sẽ xóa hệ thống Voice HDK cũ',
+          'và cho phép bạn thiết lập lại từ đầu.'
+        ].join(
+          '\n'
+        )
+      );
+
+  const row =
+    new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId(
+            'setup_reinstall_confirm'
+          )
+          .setLabel(
+            'Cài đặt lại'
+          )
+          .setEmoji(
+            '♻️'
+          )
+          .setStyle(
+            ButtonStyle.Danger
+          ),
+        new ButtonBuilder()
+          .setCustomId(
+            'setup_reinstall_cancel'
+          )
+          .setLabel(
+            'Hủy'
+          )
+          .setEmoji(
+            '✖️'
+          )
+          .setStyle(
+            ButtonStyle.Secondary
+          )
+      );
+
+  return {
+    embeds: [
+      embed
+    ],
+    components: [
+      row
+    ]
+  };
+}
+
+function buildCreateRoomPanel(
+  displayName
+) {
+  const safeName =
+    cleanDisplayName(
+      displayName
+    ) ||
+    'Voice HDK';
+
+  const embed =
+    new EmbedBuilder()
+      .setTitle(
+        '🔊 TẠO PHÒNG THOẠI'
+      )
+      .setDescription(
+        [
+          'Nhấn nút bên dưới để tạo phòng Voice riêng.',
+          '',
+          'Phòng sẽ tự động được quản lý bởi Voice HDK.'
+        ].join(
+          '\n'
+        )
+      )
+      .setFooter({
+        text:
+          `✦ ${BOT_NAME} • ${safeName}`
+      });
+
+  const row =
+    new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId(
+            'room_create'
+          )
+          .setLabel(
+            'Tạo phòng'
+          )
+          .setEmoji(
+            '➕'
+          )
+          .setStyle(
+            ButtonStyle.Success
+          )
+      );
+
+  return {
+    embeds: [
+      embed
+    ],
+    components: [
+      row
+    ]
+  };
+}
+
+function buildSetupSuccessPanel({
+  displayName,
+  buttonCategoryId,
+  blogCategoryId
+}) {
+  const embed =
+    new EmbedBuilder()
+      .setTitle(
+        '🎉 CÀI ĐẶT VOICE HDK THÀNH CÔNG!'
+      )
+      .setDescription(
+        [
+          'Chúc mừng! Voice HDK đã được cài đặt thành công',
+          'và hiện đã sẵn sàng để sử dụng.',
+          '',
+          `🏷️ **Tên Server:** ${cleanDisplayName(displayName)}`,
+          `📁 **Danh mục đặt nút:** <#${buttonCategoryId}>`,
+          `📁 **Danh mục đặt Blog:** <#${blogCategoryId}>`,
+          '',
+          'Nếu có bất kỳ thắc mắc hoặc cần hỗ trợ:',
+          '👤 **Huỳnh Duy Khánh**',
+          '☎️ **0988850044**',
+          '',
+          'Cảm ơn bạn đã sử dụng Voice HDK ❤️'
+        ].join(
+          '\n'
+        )
+      )
+      .setFooter({
+        text:
+          `✦ ${BOT_NAME} • ${cleanDisplayName(displayName)}`
+      });
+
+  return {
+    embeds: [
+      embed
+    ],
+    components: []
+  };
+}
+
+async function handleSetupCommand(
+  interaction
+) {
+  await safeDeferReply(
+    interaction,
+    true
+  );
+
+  if (!interaction.guild) {
+    await tempReply(
+      interaction,
+      '❌ Lệnh này chỉ sử dụng trong server.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  if (
+    !canManageSetup(
+      interaction
+    )
+  ) {
+    await tempReply(
+      interaction,
+      '❌ Bạn cần quyền **Quản lý Server** để cài đặt Voice HDK.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const existing =
+    await getGenerator(
+      interaction.guild.id
+    );
+
+  if (
+    existing?.create_channel_id ||
+    existing?.chat_log_channel_id ||
+    existing?.action_log_channel_id
+  ) {
+    await interaction.editReply(
+      buildReinstallPanel()
+    );
+
+    return;
+  }
+
+  const session =
+    saveSetupSession(
+      interaction.guild.id,
+      interaction.user.id,
+      {
+        displayName: '',
+        buttonCategoryId:
+          null,
+        blogCategoryId:
+          null
+      }
+    );
+
+  await interaction.editReply(
+    buildSetupPanel(
+      session
+    )
+  );
+}
+
+async function handleSetupNameButton(
+  interaction
+) {
+  if (
+    !interaction.guild ||
+    !canManageSetup(
+      interaction
+    )
+  ) {
+    await tempReply(
+      interaction,
+      '❌ Bạn không có quyền thực hiện thao tác này.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  let session =
+    getSetupSession(
+      interaction.guild.id,
+      interaction.user.id
+    );
+
+  if (!session) {
+    session =
+      saveSetupSession(
+        interaction.guild.id,
+        interaction.user.id,
+        {
+          displayName: '',
+          buttonCategoryId:
+            null,
+          blogCategoryId:
+            null
+        }
+      );
+  }
+
+  const modal =
+    new ModalBuilder()
+      .setCustomId(
+        'setup_name_modal'
+      )
+      .setTitle(
+        'Đặt tên Server'
+      );
+
+  const input =
+    new TextInputBuilder()
+      .setCustomId(
+        'setup_display_name'
+      )
+      .setLabel(
+        'Tên hiển thị'
+      )
+      .setPlaceholder(
+        'Ví dụ: ABCD'
+      )
+      .setStyle(
+        TextInputStyle.Short
+      )
+      .setMinLength(
+        1
+      )
+      .setMaxLength(
+        50
+      )
+      .setRequired(
+        true
+      );
+
+  if (
+    session.displayName
+  ) {
+    input.setValue(
+      session.displayName
+    );
+  }
+
+  modal.addComponents(
+    new ActionRowBuilder()
+      .addComponents(
+        input
+      )
+  );
+
+  await interaction.showModal(
+    modal
+  );
+}
+
+async function handleSetupNameModal(
+  interaction
+) {
+  await safeDeferReply(
+    interaction,
+    true
+  );
+
+  if (
+    !interaction.guild ||
+    !canManageSetup(
+      interaction
+    )
+  ) {
+    await tempReply(
+      interaction,
+      '❌ Bạn không có quyền thực hiện thao tác này.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const displayName =
+    cleanDisplayName(
+      interaction.fields.getTextInputValue(
+        'setup_display_name'
+      )
+    );
+
+  if (!displayName) {
+    await tempReply(
+      interaction,
+      '❌ Tên Server không hợp lệ.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const session =
+    saveSetupSession(
+      interaction.guild.id,
+      interaction.user.id,
+      {
+        displayName
+      }
+    );
+
+  await interaction.editReply(
+    {
+      content:
+        `✅ Đã đặt tên Server: **${displayName}**`
+    }
+  );
+
+  deleteReplyLater(
+    interaction,
+    SUCCESS_DELETE_MS
+  );
+
+  if (
+    interaction.message
+  ) {
+    try {
+      await interaction.message.edit(
+        buildSetupPanel(
+          session
+        )
+      );
+    } catch (error) {
+      logError(
+        'SETUP_REFRESH_AFTER_NAME',
+        error
+      );
+    }
+  }
+}
+
+async function handleSetupCategorySelect(
+  interaction,
+  type
+) {
+  await safeDeferUpdate(
+    interaction
+  );
+
+  if (
+    !interaction.guild ||
+    !canManageSetup(
+      interaction
+    )
+  ) {
+    await tempFollowUp(
+      interaction,
+      '❌ Bạn không có quyền thực hiện thao tác này.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const categoryId =
+    interaction.values?.[0];
+
+  if (
+    !isSnowflake(
+      String(categoryId)
+    )
+  ) {
+    await tempFollowUp(
+      interaction,
+      '❌ Danh mục được chọn không hợp lệ.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const category =
+    interaction.guild.channels.cache.get(
+      categoryId
+    ) ||
+    await interaction.guild.channels.fetch(
+      categoryId
+    ).catch(
+      () => null
+    );
+
+  if (
+    !category ||
+    category.type !==
+      ChannelType.GuildCategory
+  ) {
+    await tempFollowUp(
+      interaction,
+      '❌ Vui lòng chọn đúng một Danh mục Discord.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const data =
+    type === 'button'
+      ? {
+          buttonCategoryId:
+            category.id
+        }
+      : {
+          blogCategoryId:
+            category.id
+        };
+
+  const session =
+    saveSetupSession(
+      interaction.guild.id,
+      interaction.user.id,
+      data
+    );
+
+  try {
+    await interaction.editReply(
+      buildSetupPanel(
+        session
+      )
+    );
+  } catch (error) {
+    logError(
+      'SETUP_CATEGORY_REFRESH',
+      error
+    );
+  }
+}
+
+async function safeDeleteManagedChannel(
+  guild,
+  channelId,
+  reason
+) {
+  if (
+    !guild ||
+    !isSnowflake(
+      String(channelId)
+    )
+  ) {
+    return false;
+  }
+
+  let channel =
+    guild.channels.cache.get(
+      String(channelId)
+    );
+
+  if (!channel) {
+    channel =
+      await guild.channels.fetch(
+        String(channelId)
+      ).catch(
+        () => null
+      );
+  }
+
+  if (!channel) {
+    return true;
+  }
+
+  try {
+    await channel.delete(
+      reason
+    );
+
+    return true;
+  } catch (error) {
+    logError(
+      'DELETE_MANAGED_CHANNEL',
+      error
+    );
+
+    return false;
+  }
+}
+
+async function cleanupGuildInstallation(
+  guild
+) {
+  const generator =
+    await getGenerator(
+      guild.id
+    );
+
+  if (!generator) {
+    return;
+  }
+
+  const roomRows =
+    await getGuildRooms(
+      guild.id
+    );
+
+  for (
+    const room
+    of roomRows
+  ) {
+    clearPendingTransfer(
+      String(
+        room.channel_id
+      )
+    );
+
+    clearSelectionsForChannel(
+      guild.id,
+      String(
+        room.channel_id
+      )
+    );
+
+    await safeDeleteManagedChannel(
+      guild,
+      String(
+        room.channel_id
+      ),
+      `${BOT_NAME}: cài đặt lại hệ thống`
+    );
+
+    await deleteRoomRecord(
+      String(
+        room.channel_id
+      )
+    );
+  }
+
+  const managedIds =
+    [
+      generator.create_channel_id,
+      generator.chat_log_channel_id,
+      generator.action_log_channel_id
+    ]
+      .filter(
+        Boolean
+      )
+      .map(
+        id =>
+          String(id)
+      );
+
+  for (
+    const channelId
+    of new Set(
+      managedIds
+    )
+  ) {
+    await safeDeleteManagedChannel(
+      guild,
+      channelId,
+      `${BOT_NAME}: cài đặt lại hệ thống`
+    );
+  }
+
+  await deleteGenerator(
+    guild.id
+  );
+}
+
+async function handleReinstallConfirm(
+  interaction
+) {
+  await safeDeferUpdate(
+    interaction
+  );
+
+  if (
+    !interaction.guild ||
+    !canManageSetup(
+      interaction
+    )
+  ) {
+    await tempFollowUp(
+      interaction,
+      '❌ Bạn không có quyền cài đặt lại Voice HDK.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  try {
+    await cleanupGuildInstallation(
+      interaction.guild
+    );
+
+    const session =
+      saveSetupSession(
+        interaction.guild.id,
+        interaction.user.id,
+        {
+          displayName: '',
+          buttonCategoryId:
+            null,
+          blogCategoryId:
+            null
+        }
+      );
+
+    await interaction.editReply(
+      buildSetupPanel(
+        session
+      )
+    );
+  } catch (error) {
+    logError(
+      'SETUP_REINSTALL',
+      error
+    );
+
+    await tempFollowUp(
+      interaction,
+      '❌ Không thể cài đặt lại an toàn. Hệ thống đã dừng thao tác để tránh xóa nhầm dữ liệu.',
+      {
+        error: true
+      }
+    );
+  }
+}
+
+async function handleReinstallCancel(
+  interaction
+) {
+  await safeDeferUpdate(
+    interaction
+  );
+
+  deleteSetupSession(
+    interaction.guildId,
+    interaction.user.id
+  );
+
+  try {
+    await interaction.editReply({
+      content:
+        '✖️ Đã hủy cài đặt lại Voice HDK.',
+      embeds: [],
+      components: []
+    });
+  } catch (error) {
+    logError(
+      'SETUP_REINSTALL_CANCEL',
+      error
+    );
+  }
+
+  deleteReplyLater(
+    interaction,
+    SUCCESS_DELETE_MS
+  );
+}
+
+async function createManagedTextChannel(
+  guild,
+  category,
+  name,
+  topic
+) {
+  const botMember =
+    await getBotMember(
+      guild
+    );
+
+  if (!botMember) {
+    throw new Error(
+      'Không tìm thấy bot trong server.'
+    );
+  }
+
+  return guild.channels.create({
+    name,
+    type:
+      ChannelType.GuildText,
+    parent:
+      category.id,
+    topic,
+    reason:
+      `${BOT_NAME}: cài đặt hệ thống`,
+    permissionOverwrites: [
+      {
+        id:
+          guild.roles.everyone.id,
+        allow: [
+          PermissionsBitField.Flags.ViewChannel,
+          PermissionsBitField.Flags.ReadMessageHistory
+        ]
+      },
+      {
+        id:
+          botMember.id,
+        allow: [
+          PermissionsBitField.Flags.ViewChannel,
+          PermissionsBitField.Flags.SendMessages,
+          PermissionsBitField.Flags.EmbedLinks,
+          PermissionsBitField.Flags.ReadMessageHistory,
+          PermissionsBitField.Flags.ManageChannels
+        ]
+      }
+    ]
+  });
+}
+
+async function rollbackCreatedChannels(
+  channels
+) {
+  for (
+    const channel
+    of [...channels].reverse()
+  ) {
+    if (!channel) {
+      continue;
+    }
+
+    try {
+      await channel.delete(
+        `${BOT_NAME}: hoàn tác cài đặt lỗi`
+      );
+    } catch (error) {
+      logError(
+        'SETUP_ROLLBACK_CHANNEL',
+        error
+      );
+    }
+  }
+}
+
+async function installGuildSystem(
+  guild,
+  session
+) {
+  const displayName =
+    cleanDisplayName(
+      session.displayName
+    );
+
+  if (!displayName) {
+    throw new Error(
+      'Bạn chưa đặt tên Server.'
+    );
+  }
+
+  const buttonCategory =
+    guild.channels.cache.get(
+      String(
+        session.buttonCategoryId
+      )
+    ) ||
+    await guild.channels.fetch(
+      String(
+        session.buttonCategoryId
+      )
+    ).catch(
+      () => null
+    );
+
+  const blogCategory =
+    guild.channels.cache.get(
+      String(
+        session.blogCategoryId
+      )
+    ) ||
+    await guild.channels.fetch(
+      String(
+        session.blogCategoryId
+      )
+    ).catch(
+      () => null
+    );
+
+  if (
+    !buttonCategory ||
+    buttonCategory.type !==
+      ChannelType.GuildCategory
+  ) {
+    throw new Error(
+      'Danh mục đặt nút không còn tồn tại.'
+    );
+  }
+
+  if (
+    !blogCategory ||
+    blogCategory.type !==
+      ChannelType.GuildCategory
+  ) {
+    throw new Error(
+      'Danh mục đặt Blog không còn tồn tại.'
+    );
+  }
+
+  const permissionCheck =
+    await validateSetupPermissions(
+      guild,
+      buttonCategory,
+      blogCategory
+    );
+
+  if (
+    !permissionCheck.ok
+  ) {
+    throw new Error(
+      'Bot đang thiếu quyền: ' +
+      permissionCheck.missing.join(
+        ', '
+      )
+    );
+  }
+
+  const created = [];
+
+  try {
+    const createChannel =
+      await createManagedTextChannel(
+        guild,
+        buttonCategory,
+        CREATE_CHANNEL_NAME,
+        `${BOT_NAME} • Nút tạo phòng`
+      );
+
+    created.push(
+      createChannel
+    );
+
+    const chatLogChannel =
+      await createManagedTextChannel(
+        guild,
+        blogCategory,
+        CHAT_LOG_CHANNEL_NAME,
+        `${BOT_NAME} • Nhật ký Chat`
+      );
+
+    created.push(
+      chatLogChannel
+    );
+
+    const actionLogChannel =
+      await createManagedTextChannel(
+        guild,
+        blogCategory,
+        ACTION_LOG_CHANNEL_NAME,
+        `${BOT_NAME} • Nhật ký Chức năng`
+      );
+
+    created.push(
+      actionLogChannel
+    );
+
+    const createMessage =
+      await createChannel.send(
+        buildCreateRoomPanel(
+          displayName
+        )
+      );
+
+    let saved;
+
+    try {
+      saved =
+        await saveGenerator({
+          guildId:
+            guild.id,
+          displayName,
+          buttonCategoryId:
+            buttonCategory.id,
+          blogCategoryId:
+            blogCategory.id,
+          createChannelId:
+            createChannel.id,
+          createMessageId:
+            createMessage.id,
+          chatLogChannelId:
+            chatLogChannel.id,
+          actionLogChannelId:
+            actionLogChannel.id
+        });
+    } catch (error) {
+      logError(
+        'SETUP_SAVE_DATABASE',
+        error
+      );
+
+      await rollbackCreatedChannels(
+        created
+      );
+
+      throw new Error(
+        'Không thể lưu cấu hình vào Database. Các kênh vừa tạo đã được hoàn tác.'
+      );
+    }
+
+    return {
+      generator:
+        saved,
+      buttonCategory,
+      blogCategory,
+      createChannel,
+      chatLogChannel,
+      actionLogChannel,
+      createMessage
+    };
+  } catch (error) {
+    if (
+      created.length
+    ) {
+      await rollbackCreatedChannels(
+        created
+      );
+    }
+
+    throw error;
+  }
+}
+
+async function handleSetupInstall(
+  interaction
+) {
+  await safeDeferUpdate(
+    interaction
+  );
+
+  if (
+    !interaction.guild ||
+    !canManageSetup(
+      interaction
+    )
+  ) {
+    await tempFollowUp(
+      interaction,
+      '❌ Bạn không có quyền cài đặt Voice HDK.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const session =
+    getSetupSession(
+      interaction.guild.id,
+      interaction.user.id
+    );
+
+  if (!session) {
+    await tempFollowUp(
+      interaction,
+      '❌ Phiên thiết lập đã hết hạn. Hãy chạy lại `/setup`.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  if (
+    !cleanDisplayName(
+      session.displayName
+    ) ||
+    !session.buttonCategoryId ||
+    !session.blogCategoryId
+  ) {
+    await tempFollowUp(
+      interaction,
+      '❌ Vui lòng đặt tên Server và chọn đủ 2 Danh mục.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const cooldown =
+    useCooldown(
+      interaction.user.id,
+      'setup_install',
+      5000
+    );
+
+  if (cooldown) {
+    await tempFollowUp(
+      interaction,
+      '⏳ Vui lòng chờ một chút trước khi cài đặt lại.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const existing =
+    await getGenerator(
+      interaction.guild.id
+    );
+
+  if (
+    existing?.create_channel_id ||
+    existing?.chat_log_channel_id ||
+    existing?.action_log_channel_id
+  ) {
+    await tempFollowUp(
+      interaction,
+      '⚠️ Server đã có hệ thống Voice HDK. Hãy chạy `/setup` và chọn **Cài đặt lại** trước.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  try {
+    const installed =
+      await installGuildSystem(
+        interaction.guild,
+        session
+      );
+
+    deleteSetupSession(
+      interaction.guild.id,
+      interaction.user.id
+    );
+
+    await interaction.editReply(
+      buildSetupSuccessPanel({
+        displayName:
+          installed.generator.display_name,
+        buttonCategoryId:
+          installed.buttonCategory.id,
+        blogCategoryId:
+          installed.blogCategory.id
+      })
+    );
+  } catch (error) {
+    logError(
+      'SETUP_INSTALL',
+      error
+    );
+
+    await tempFollowUp(
+      interaction,
+      `❌ Cài đặt thất bại: ${String(
+        error?.message ||
+        'Lỗi không xác định.'
+      ).slice(0, 1500)}`,
+      {
+        error: true
+      }
+    );
+  }
+}
+function roomDashboardLine(
+  icon,
+  label,
+  value
+) {
+  const safeLabel =
+    String(label)
+      .slice(
+        0,
+        12
+      )
+      .padEnd(
+        12,
+        ' '
+      );
+
+  return (
+    `${icon} ${safeLabel}${value}`
+  );
+}
+
+function buildRoomDashboard(
+  channel,
+  owner,
+  generator
+) {
+  const state =
+    getRoomState(
+      channel
+    );
+
+  const humans =
     channel.members.filter(
       member =>
         !member.user.bot
-    ).size;
+    );
 
   const limit =
     channel.userLimit > 0
-      ? String(channel.userLimit)
-      : 'Không giới hạn';
+      ? String(
+          channel.userLimit
+        )
+      : '∞';
 
-  const roomStatus =
-    locked
-      ? 'Đã khóa'
-      : 'Đang mở';
+  const region =
+    channel.rtcRegion
+      ? String(
+          channel.rtcRegion
+        )
+      : 'Tự động';
 
-  const visibility =
-    hidden
-      ? 'Đang ẩn'
-      : 'Công khai';
-
-  const serverLabel =
-    safeDisplayName(
-      generator?.display_name ||
-      channel.guild.name,
-      26
+  const ownerName =
+    safeMemberName(
+      owner
     );
+
+  const displayName =
+    cleanDisplayName(
+      generator?.display_name
+    ) ||
+    'Voice HDK';
+
+  const titleName =
+    cleanRoomName(
+      channel.name
+    )
+      .toUpperCase()
+      .slice(
+        0,
+        35
+      );
 
   return [
-    `🔊  PHÒNG CỦA ${ownerName}`,
+    `🔊  ${titleName}`,
     '────────────────────────────',
-    `👑 Chủ phòng    ${safeMemberName(owner)}`,
-    `👥 Thành viên   ${memberCount} / ${limit}`,
-    `🔓 Phòng        ${roomStatus}`,
-    `👁 Hiển thị     ${visibility}`,
-    `🌐 Khu vực      ${regionLabel}`,
+    roomDashboardLine(
+      '👑',
+      'Chủ phòng',
+      ownerName
+    ),
+    roomDashboardLine(
+      '👥',
+      'Thành viên',
+      `${humans.size} / ${limit}`
+    ),
+    roomDashboardLine(
+      state.locked
+        ? '🔒'
+        : '🔓',
+      'Phòng',
+      state.locked
+        ? 'Đang khóa'
+        : 'Đang mở'
+    ),
+    roomDashboardLine(
+      state.hidden
+        ? '🙈'
+        : '👁️',
+      'Hiển thị',
+      state.hidden
+        ? 'Đang ẩn'
+        : 'Công khai'
+    ),
+    roomDashboardLine(
+      '🌐',
+      'Khu vực',
+      region
+    ),
     '────────────────────────────',
-    `✦ Voice HDK • ${serverLabel}`
-  ].join('\n');
+    `✦ ${BOT_NAME} • ${displayName}`
+  ].join(
+    '\n'
+  );
 }
 
-async function buildRoomPanel(
-  channel,
-  room
+async function buildRegionMenu(
+  channel
 ) {
-  const owner =
-    await channel.guild.members
-      .fetch(room.owner_id)
-      .catch(() => null);
-
-  if (!owner) {
-    throw new Error(
-      'Không tìm thấy chủ phòng.'
-    );
-  }
-
-  const generator =
-    await getGenerator(
-      channel.guild.id
-    );
-
   let regions = [];
 
   try {
@@ -1653,268 +3625,304 @@ async function buildRoomPanel(
       await getVoiceRegions();
   } catch (error) {
     logError(
-      'VOICE_REGIONS_PANEL',
-      error,
-      {
-        channelId:
-          channel.id
-      }
+      'BUILD_REGION_MENU',
+      error
     );
   }
 
-  const regionLabel =
-    getRegionLabel(
-      channel,
-      regions
-    );
+  const current =
+    channel.rtcRegion ||
+    'automatic';
 
-  const {
-    locked,
-    hidden
-  } = getRoomState(channel);
-
-  const dashboard =
-    makePanelDashboard({
-      channel,
-      owner,
-      generator,
-      regionLabel
-    });
-
-  const embed =
-    new EmbedBuilder()
-      .setColor(
-        getPanelColor(
-          locked,
-          hidden
-        )
-      )
-      .setDescription(
-        `\`\`\`\n${dashboard}\n\`\`\``
-      )
-      .setThumbnail(
-        owner.displayAvatarURL({
-          size: 128
-        })
-      );
-
-  const row1 =
-    new ActionRowBuilder()
-      .addComponents(
-        new ButtonBuilder()
-          .setCustomId(
-            locked
-              ? 'vc_unlock'
-              : 'vc_lock'
-          )
-          .setLabel(
-            locked
-              ? 'Mở'
-              : 'Khóa'
-          )
-          .setEmoji(
-            locked
-              ? '🔓'
-              : '🔒'
-          )
-          .setStyle(
-            locked
-              ? ButtonStyle.Success
-              : ButtonStyle.Secondary
-          ),
-
-        new ButtonBuilder()
-          .setCustomId(
-            hidden
-              ? 'vc_show'
-              : 'vc_hide'
-          )
-          .setLabel(
-            hidden
-              ? 'Hiện'
-              : 'Ẩn'
-          )
-          .setEmoji(
-            hidden
-              ? '👁️'
-              : '🙈'
-          )
-          .setStyle(
-            hidden
-              ? ButtonStyle.Success
-              : ButtonStyle.Secondary
-          ),
-
-        new ButtonBuilder()
-          .setCustomId(
-            'vc_rename'
-          )
-          .setLabel(
-            'Đổi tên'
-          )
-          .setEmoji('✏️')
-          .setStyle(
-            ButtonStyle.Secondary
-          )
-      );
-
-  const row2 =
-    new ActionRowBuilder()
-      .addComponents(
-        new ButtonBuilder()
-          .setCustomId(
-            'vc_reset'
-          )
-          .setLabel(
-            'Đặt lại'
-          )
-          .setEmoji('♻️')
-          .setStyle(
-            ButtonStyle.Secondary
-          ),
-
-        new ButtonBuilder()
-          .setCustomId(
-            'vc_limit'
-          )
-          .setLabel(
-            'Giới hạn'
-          )
-          .setEmoji('👥')
-          .setStyle(
-            ButtonStyle.Secondary
-          ),
-
-        new ButtonBuilder()
-          .setCustomId(
-            'vc_invite'
-          )
-          .setLabel(
-            'Mời'
-          )
-          .setEmoji('✉️')
-          .setStyle(
-            ButtonStyle.Primary
-          )
-      );
-
-  const row3 =
-    new ActionRowBuilder()
-      .addComponents(
-        new ButtonBuilder()
-          .setCustomId(
-            'vc_transfer'
-          )
-          .setLabel(
-            'Chuyển chủ'
-          )
-          .setEmoji('👑')
-          .setStyle(
-            ButtonStyle.Secondary
-          ),
-
-        new ButtonBuilder()
-          .setCustomId(
-            'vc_deny'
-          )
-          .setLabel(
-            'Cấm'
-          )
-          .setEmoji('⛔')
-          .setStyle(
-            ButtonStyle.Danger
-          ),
-
-        new ButtonBuilder()
-          .setCustomId(
-            'vc_kick'
-          )
-          .setLabel(
-            'Đuổi'
-          )
-          .setEmoji('👢')
-          .setStyle(
-            ButtonStyle.Danger
-          )
-      );
-
-  const memberMenu =
-    new UserSelectMenuBuilder()
-      .setCustomId(
-        'vc_member_select'
-      )
-      .setPlaceholder(
-        'Chọn thành viên'
-      )
-      .setMinValues(1)
-      .setMaxValues(1);
-
-  const row4 =
-    new ActionRowBuilder()
-      .addComponents(
-        memberMenu
-      );
-
-  const regionOptions = [
+  const options = [
     {
-      label: 'Tự động',
-      value: 'automatic',
-      emoji: '🌐',
+      label:
+        'Tự động',
+      value:
+        'automatic',
+      emoji:
+        '🌐',
       default:
-        !channel.rtcRegion
+        current ===
+        'automatic'
     }
   ];
 
   for (
     const region
-    of regions.slice(0, 24)
+    of regions
   ) {
-    regionOptions.push({
-      label:
-        safeDisplayName(
-          region.name ||
-          region.id,
-          80
-        ),
+    if (
+      options.length >= 25
+    ) {
+      break;
+    }
 
+    options.push({
+      label:
+        region.name
+          .slice(
+            0,
+            100
+          ),
       value:
         region.id,
-
+      emoji:
+        region.optimal
+          ? '⚡'
+          : '🌐',
       default:
-        channel.rtcRegion ===
+        current ===
         region.id
     });
   }
 
-  const regionMenu =
+  return (
     new StringSelectMenuBuilder()
       .setCustomId(
-        'vc_region'
+        'room_region'
       )
       .setPlaceholder(
-        `🌐 ${regionLabel}`
+        '🌐 Chọn khu vực'
       )
-      .setMinValues(1)
-      .setMaxValues(1)
+      .setMinValues(
+        1
+      )
+      .setMaxValues(
+        1
+      )
       .addOptions(
-        regionOptions
+        options
+      )
+  );
+}
+
+async function buildRoomPanel(
+  channel,
+  room
+) {
+  const owner =
+    await getRoomOwnerMember(
+      room,
+      channel.guild
+    );
+
+  const generator =
+    await getGenerator(
+      channel.guild.id
+    );
+
+  const state =
+    getRoomState(
+      channel
+    );
+
+  const dashboard =
+    buildRoomDashboard(
+      channel,
+      owner,
+      generator
+    );
+
+  const embed =
+    new EmbedBuilder()
+      .setDescription(
+        `\`\`\`\n${dashboard}\n\`\`\``
       );
 
-  const row5 =
+  if (
+    owner?.user
+  ) {
+    embed.setAuthor({
+      name:
+        safeMemberName(
+          owner
+        ),
+      iconURL:
+        owner.displayAvatarURL({
+          size: 128
+        })
+    });
+  }
+
+  const firstRow =
     new ActionRowBuilder()
       .addComponents(
-        regionMenu
+        new ButtonBuilder()
+          .setCustomId(
+            'room_lock'
+          )
+          .setLabel(
+            state.locked
+              ? 'Mở'
+              : 'Khóa'
+          )
+          .setEmoji(
+            state.locked
+              ? '🔓'
+              : '🔒'
+          )
+          .setStyle(
+            state.locked
+              ? ButtonStyle.Success
+              : ButtonStyle.Secondary
+          ),
+        new ButtonBuilder()
+          .setCustomId(
+            'room_hide'
+          )
+          .setLabel(
+            state.hidden
+              ? 'Hiện'
+              : 'Ẩn'
+          )
+          .setEmoji(
+            state.hidden
+              ? '👁️'
+              : '🙈'
+          )
+          .setStyle(
+            ButtonStyle.Secondary
+          ),
+        new ButtonBuilder()
+          .setCustomId(
+            'room_rename'
+          )
+          .setLabel(
+            'Đổi tên'
+          )
+          .setEmoji(
+            '✏️'
+          )
+          .setStyle(
+            ButtonStyle.Secondary
+          )
+      );
+
+  const secondRow =
+    new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId(
+            'room_reset'
+          )
+          .setLabel(
+            'Đặt lại'
+          )
+          .setEmoji(
+            '♻️'
+          )
+          .setStyle(
+            ButtonStyle.Secondary
+          ),
+        new ButtonBuilder()
+          .setCustomId(
+            'room_limit'
+          )
+          .setLabel(
+            'Giới hạn'
+          )
+          .setEmoji(
+            '👥'
+          )
+          .setStyle(
+            ButtonStyle.Secondary
+          ),
+        new ButtonBuilder()
+          .setCustomId(
+            'room_invite'
+          )
+          .setLabel(
+            'Mời'
+          )
+          .setEmoji(
+            '✉️'
+          )
+          .setStyle(
+            ButtonStyle.Secondary
+          )
+      );
+
+  const thirdRow =
+    new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId(
+            'room_transfer'
+          )
+          .setLabel(
+            'Chuyển chủ'
+          )
+          .setEmoji(
+            '👑'
+          )
+          .setStyle(
+            ButtonStyle.Secondary
+          ),
+        new ButtonBuilder()
+          .setCustomId(
+            'room_deny'
+          )
+          .setLabel(
+            'Cấm'
+          )
+          .setEmoji(
+            '⛔'
+          )
+          .setStyle(
+            ButtonStyle.Danger
+          ),
+        new ButtonBuilder()
+          .setCustomId(
+            'room_kick'
+          )
+          .setLabel(
+            'Đuổi'
+          )
+          .setEmoji(
+            '👢'
+          )
+          .setStyle(
+            ButtonStyle.Danger
+          )
+      );
+
+  const memberRow =
+    new ActionRowBuilder()
+      .addComponents(
+        new UserSelectMenuBuilder()
+          .setCustomId(
+            'room_member'
+          )
+          .setPlaceholder(
+            '👤 Chọn thành viên'
+          )
+          .setMinValues(
+            1
+          )
+          .setMaxValues(
+            1
+          )
+      );
+
+  const regionRow =
+    new ActionRowBuilder()
+      .addComponents(
+        await buildRegionMenu(
+          channel
+        )
       );
 
   return {
-    embeds: [embed],
-
+    embeds: [
+      embed
+    ],
     components: [
-      row1,
-      row2,
-      row3,
-      row4,
-      row5
+      firstRow,
+      secondRow,
+      thirdRow,
+      memberRow,
+      regionRow
     ]
   };
 }
@@ -1930,115 +3938,130 @@ function isRoomPanelMessage(
     return false;
   }
 
-  const customIds =
-    message.components
-      ?.flatMap(
-        row =>
-          row.components || []
-      )
-      .map(
-        component =>
-          component.customId
-      )
-      .filter(Boolean) || [];
-
-  return (
-    customIds.includes(
-      'vc_member_select'
-    ) &&
-    customIds.includes(
-      'vc_region'
-    ) &&
-    (
-      customIds.includes(
-        'vc_lock'
-      ) ||
-      customIds.includes(
-        'vc_unlock'
-      )
-    )
-  );
-}
-
-async function findExistingPanel(
-  channel,
-  room
-) {
-  if (
-    room.control_message_id
+  for (
+    const row
+    of message.components || []
   ) {
-    const stored =
-      await channel.messages
-        .fetch(
-          room.control_message_id
-        )
-        .catch(() => null);
-
-    if (
-      stored &&
-      isRoomPanelMessage(stored)
+    for (
+      const component
+      of row.components || []
     ) {
-      return stored;
+      const customId =
+        component.customId ||
+        component.custom_id;
+
+      if (
+        customId ===
+        'room_lock' ||
+        customId ===
+        'room_member' ||
+        customId ===
+        'room_region'
+      ) {
+        return true;
+      }
     }
   }
 
-  const recent =
-    await channel.messages
-      .fetch({
-        limit: 50
-      })
-      .catch(() => null);
+  return false;
+}
 
-  if (!recent) {
-    return null;
-  }
-
-  const panels = [
-    ...recent.values()
-  ]
-    .filter(
-      isRoomPanelMessage
+async function fetchMessageSafe(
+  channel,
+  messageId
+) {
+  if (
+    !channel?.messages ||
+    !isSnowflake(
+      String(messageId)
     )
-    .sort(
-      (a, b) =>
-        b.createdTimestamp -
-        a.createdTimestamp
-    );
-
-  if (!panels.length) {
+  ) {
     return null;
   }
 
-  const newest =
-    panels[0];
-
-  for (
-    const duplicate
-    of panels.slice(1)
-  ) {
-    await duplicate
-      .delete()
-      .catch(() => {});
+  try {
+    return await channel.messages.fetch(
+      String(messageId)
+    );
+  } catch {
+    return null;
   }
+}
+
+async function findRoomPanelMessages(
+  channel,
+  room
+) {
+  const found =
+    new Map();
 
   if (
-    String(
-      room.control_message_id ||
-      ''
-    ) !==
-    String(newest.id)
+    room?.control_message_id
   ) {
-    await setControlMessage(
-      channel.id,
-      newest.id
+    const stored =
+      await fetchMessageSafe(
+        channel,
+        String(
+          room.control_message_id
+        )
+      );
+
+    if (
+      stored &&
+      isRoomPanelMessage(
+        stored
+      )
+    ) {
+      found.set(
+        stored.id,
+        stored
+      );
+    }
+  }
+
+  try {
+    const messages =
+      await channel.messages.fetch({
+        limit: 50
+      });
+
+    for (
+      const message
+      of messages.values()
+    ) {
+      if (
+        isRoomPanelMessage(
+          message
+        )
+      ) {
+        found.set(
+          message.id,
+          message
+        );
+      }
+    }
+  } catch (error) {
+    logError(
+      'FIND_ROOM_PANELS',
+      error
     );
   }
 
-  return newest;
+  return (
+    [...found.values()]
+      .sort(
+        (a, b) =>
+          b.createdTimestamp -
+          a.createdTimestamp
+      )
+  );
 }
 
 async function refreshRoomPanel(
-  channelId
+  channelId,
+  {
+    forceRebuild = false
+  } = {}
 ) {
   return withPanelLock(
     channelId,
@@ -2052,16 +4075,46 @@ async function refreshRoomPanel(
         return null;
       }
 
-      const channel =
-        await client.channels
-          .fetch(channelId)
-          .catch(() => null);
+      const guild =
+        client.guilds.cache.get(
+          String(
+            room.guild_id
+          )
+        );
+
+      if (!guild) {
+        return null;
+      }
+
+      let channel =
+        guild.channels.cache.get(
+          String(
+            channelId
+          )
+        );
+
+      if (!channel) {
+        channel =
+          await guild.channels.fetch(
+            String(
+              channelId
+            )
+          ).catch(
+            () => null
+          );
+      }
 
       if (
         !channel ||
         channel.type !==
           ChannelType.GuildVoice
       ) {
+        await deleteRoomRecord(
+          String(
+            channelId
+          )
+        );
+
         return null;
       }
 
@@ -2071,40 +4124,80 @@ async function refreshRoomPanel(
           room
         );
 
-      let panel =
-        await findExistingPanel(
+      const panels =
+        await findRoomPanelMessages(
           channel,
           room
         );
 
+      let panel =
+        panels[0] ||
+        null;
+
+      if (
+        forceRebuild &&
+        panel
+      ) {
+        try {
+          await panel.delete();
+        } catch {
+        }
+
+        panel = null;
+      }
+
       if (panel) {
         try {
-          panel =
-            await panel.edit(
-              payload
-            );
-
-          return panel;
+          await panel.edit(
+            payload
+          );
         } catch (error) {
           logError(
-            'PANEL_EDIT',
-            error,
-            {
-              channelId
-            }
+            'EDIT_ROOM_PANEL',
+            error
           );
+
+          try {
+            await panel.delete();
+          } catch {
+          }
+
+          panel = null;
         }
       }
 
-      panel =
-        await channel.send(
-          payload
-        );
+      if (!panel) {
+        panel =
+          await channel.send(
+            payload
+          );
+      }
 
       await setControlMessage(
         channel.id,
         panel.id
       );
+
+      for (
+        const duplicate
+        of panels
+      ) {
+        if (
+          duplicate.id ===
+          panel.id
+        ) {
+          continue;
+        }
+
+        try {
+          await duplicate.delete();
+        } catch (error) {
+          logError(
+            'DELETE_DUPLICATE_PANEL',
+            error
+          );
+        }
+      }
 
       return panel;
     }
@@ -2112,880 +4205,227 @@ async function refreshRoomPanel(
 }
 
 async function refreshRoomPanelSafe(
-  channelId
+  channelId,
+  options = {}
 ) {
   try {
     return await refreshRoomPanel(
-      channelId
+      channelId,
+      options
     );
   } catch (error) {
     logError(
-      'PANEL_REFRESH',
-      error,
-      {
-        channelId
-      }
+      'REFRESH_ROOM_PANEL',
+      error
     );
 
     return null;
   }
 }
-function buildSetupPanel(
-  session
+
+async function deleteManagedRoom(
+  channelId,
+  reason =
+    `${BOT_NAME}: xóa phòng`
 ) {
-  const selectedChannel =
-    session?.channelId
-      ? `<#${session.channelId}>`
-      : 'Chưa chọn';
-
-  const displayName =
-    session?.displayName
-      ? safeDisplayName(
-          session.displayName,
-          32
-        )
-      : 'Chưa đặt';
-
-  const embed =
-    new EmbedBuilder()
-      .setColor(APP_COLOR)
-      .setTitle(
-        '⚙️ Thiết lập Voice HDK'
-      )
-      .setDescription(
-        [
-          'Chọn kênh để đặt nút **Tạo phòng**.',
-          '',
-          `📍 Kênh: ${selectedChannel}`,
-          `🏷️ Tên panel: **${displayName}**`,
-          '',
-          'Tên panel chỉ xuất hiện trong phòng thoại.',
-          'Nút tạo phòng vẫn luôn hiển thị **➕ Tạo phòng**.'
-        ].join('\n')
-      );
-
-  const channelSelect =
-    new ChannelSelectMenuBuilder()
-      .setCustomId(
-        'setup_channel'
-      )
-      .setPlaceholder(
-        'Chọn kênh đặt nút Tạo phòng'
-      )
-      .setChannelTypes(
-        ChannelType.GuildText,
-        ChannelType.GuildAnnouncement
-      )
-      .setMinValues(1)
-      .setMaxValues(1);
-
-  const channelRow =
-    new ActionRowBuilder()
-      .addComponents(
-        channelSelect
-      );
-
-  const nameButton =
-    new ButtonBuilder()
-      .setCustomId(
-        'setup_name'
-      )
-      .setLabel(
-        session?.displayName
-          ? 'Đổi tên'
-          : 'Đặt tên'
-      )
-      .setEmoji('✏️')
-      .setStyle(
-        ButtonStyle.Secondary
-      );
-
-  const confirmButton =
-    new ButtonBuilder()
-      .setCustomId(
-        'setup_confirm'
-      )
-      .setLabel(
-        'Hoàn tất'
-      )
-      .setEmoji('✅')
-      .setStyle(
-        ButtonStyle.Success
-      )
-      .setDisabled(
-        !session?.channelId ||
-        !session?.displayName
-      );
-
-  const buttonRow =
-    new ActionRowBuilder()
-      .addComponents(
-        nameButton,
-        confirmButton
-      );
-
-  return {
-    embeds: [embed],
-    components: [
-      channelRow,
-      buttonRow
-    ]
-  };
-}
-
-function buildCreateRoomPanel() {
-  const embed =
-    new EmbedBuilder()
-      .setColor(APP_COLOR)
-      .setTitle(
-        '🔊 Tạo phòng thoại'
-      )
-      .setDescription(
-        [
-          'Tạo một phòng thoại riêng dành cho bạn.',
-          '',
-          'Phòng sẽ tự động được quản lý bởi **Voice HDK**.'
-        ].join('\n')
-      );
-
-  const createButton =
-    new ButtonBuilder()
-      .setCustomId(
-        'voice_create'
-      )
-      .setLabel(
-        'Tạo phòng'
-      )
-      .setEmoji('➕')
-      .setStyle(
-        ButtonStyle.Primary
-      );
-
-  return {
-    embeds: [embed],
-    components: [
-      new ActionRowBuilder()
-        .addComponents(
-          createButton
-        )
-    ]
-  };
-}
-
-async function handleSetupCommand(
-  interaction
-) {
-  if (!interaction.guild) {
-    return tempReply(
-      interaction,
-      '❌ Lệnh này chỉ dùng trong máy chủ.',
-      {
-        error: true
-      }
+  const room =
+    await getRoom(
+      channelId
     );
+
+  if (!room) {
+    return false;
   }
 
-  if (
-    !interaction.memberPermissions?.has(
-      PermissionsBitField.Flags.ManageGuild
-    )
-  ) {
-    return tempReply(
-      interaction,
-      '⛔ Bạn cần quyền Quản lý máy chủ để thiết lập Voice HDK.',
-      {
-        error: true
-      }
-    );
-  }
-
-  const missing =
-    getMissingPermissions(
-      interaction.guild
-    );
-
-  if (missing.length) {
-    return tempReply(
-      interaction,
-      '❌ Voice HDK đang thiếu quyền: ' +
-      permissionNames(
-        missing
-      ).join(', '),
-      {
-        error: true,
-        delay: 8000
-      }
-    );
-  }
-
-  const current =
-    await getGenerator(
-      interaction.guild.id
-    );
-
-  setSetupSession(
-    interaction.guild.id,
-    interaction.user.id,
-    {
-      channelId:
-        current?.setup_channel_id ||
-        null,
-
-      displayName:
-        current?.display_name ||
-        null
-    }
-  );
-
-  const session =
-    getSetupSession(
-      interaction.guild.id,
-      interaction.user.id
-    );
-
-  await interaction.reply({
-    ...buildSetupPanel(
-      session
-    ),
-    ephemeral: true
-  });
-}
-
-async function handleSetupChannelSelect(
-  interaction
-) {
-  if (!interaction.guild) {
-    return;
-  }
-
-  if (
-    !interaction.memberPermissions?.has(
-      PermissionsBitField.Flags.ManageGuild
-    )
-  ) {
-    return tempReply(
-      interaction,
-      '⛔ Bạn không có quyền thiết lập.',
-      {
-        error: true
-      }
-    );
-  }
-
-  let session =
-    getSetupSession(
-      interaction.guild.id,
-      interaction.user.id
-    );
-
-  if (!session) {
-    setSetupSession(
-      interaction.guild.id,
-      interaction.user.id
-    );
-
-    session =
-      getSetupSession(
-        interaction.guild.id,
-        interaction.user.id
-      );
-  }
-
-  const channelId =
-    interaction.values?.[0];
-
-  const channel =
-    await interaction.guild.channels
-      .fetch(channelId)
-      .catch(() => null);
-
-  if (
-    !channel ||
-    (
-      channel.type !==
-        ChannelType.GuildText &&
-      channel.type !==
-        ChannelType.GuildAnnouncement
-    )
-  ) {
-    return tempReply(
-      interaction,
-      '❌ Kênh đã chọn không hợp lệ.',
-      {
-        error: true
-      }
-    );
-  }
-
-  const me =
-    interaction.guild.members.me ||
-    await interaction.guild.members
-      .fetchMe();
-
-  const permissions =
-    channel.permissionsFor(me);
-
-  const required = [
-    PermissionsBitField.Flags.ViewChannel,
-    PermissionsBitField.Flags.SendMessages,
-    PermissionsBitField.Flags.EmbedLinks,
-    PermissionsBitField.Flags.ReadMessageHistory
-  ];
-
-  const missing =
-    required.filter(
-      permission =>
-        !permissions?.has(
-          permission
-        )
-    );
-
-  if (missing.length) {
-    return tempReply(
-      interaction,
-      '❌ Voice HDK thiếu quyền trong kênh này: ' +
-      permissionNames(
-        missing
-      ).join(', '),
-      {
-        error: true
-      }
-    );
-  }
-
-  session.channelId =
-    channel.id;
-
-  session.expiresAt =
-    Date.now() +
-    SETUP_SESSION_MS;
-
-  setupSessions.set(
-    setupSessionKey(
-      interaction.guild.id,
-      interaction.user.id
-    ),
-    session
-  );
-
-  await interaction.update(
-    buildSetupPanel(
-      session
-    )
-  );
-}
-
-async function showSetupNameModal(
-  interaction
-) {
-  if (!interaction.guild) {
-    return;
-  }
-
-  let session =
-    getSetupSession(
-      interaction.guild.id,
-      interaction.user.id
-    );
-
-  if (!session) {
-    setSetupSession(
-      interaction.guild.id,
-      interaction.user.id
-    );
-
-    session =
-      getSetupSession(
-        interaction.guild.id,
-        interaction.user.id
-      );
-  }
-
-  const input =
-    new TextInputBuilder()
-      .setCustomId(
-        'setup_display_name'
-      )
-      .setLabel(
-        'Tên hiển thị trong panel'
-      )
-      .setPlaceholder(
-        'Ví dụ: Khủng Long Con'
-      )
-      .setStyle(
-        TextInputStyle.Short
-      )
-      .setRequired(true)
-      .setMinLength(1)
-      .setMaxLength(32);
-
-  if (session.displayName) {
-    input.setValue(
-      safeDisplayName(
-        session.displayName,
-        32
+  const guild =
+    client.guilds.cache.get(
+      String(
+        room.guild_id
       )
     );
-  }
 
-  const modal =
-    new ModalBuilder()
-      .setCustomId(
-        'setup_name_modal'
-      )
-      .setTitle(
-        'Tên hiển thị Voice HDK'
-      )
-      .addComponents(
-        new ActionRowBuilder()
-          .addComponents(input)
-      );
-
-  await interaction.showModal(
-    modal
-  );
-}
-
-async function handleSetupNameModal(
-  interaction
-) {
-  if (!interaction.guild) {
-    return;
-  }
-
-  const rawName =
-    interaction.fields
-      .getTextInputValue(
-        'setup_display_name'
-      );
-
-  const displayName =
-    safeDisplayName(
-      rawName,
-      32
-    );
-
-  if (
-    !displayName ||
-    displayName === 'Máy chủ'
-  ) {
-    return tempReply(
-      interaction,
-      '❌ Tên hiển thị không hợp lệ.',
-      {
-        error: true
-      }
-    );
-  }
-
-  let session =
-    getSetupSession(
-      interaction.guild.id,
-      interaction.user.id
-    );
-
-  if (!session) {
-    setSetupSession(
-      interaction.guild.id,
-      interaction.user.id,
-      {
-        displayName
-      }
-    );
-
-    session =
-      getSetupSession(
-        interaction.guild.id,
-        interaction.user.id
-      );
-  } else {
-    session.displayName =
-      displayName;
-
-    session.expiresAt =
-      Date.now() +
-      SETUP_SESSION_MS;
-
-    setupSessions.set(
-      setupSessionKey(
-        interaction.guild.id,
-        interaction.user.id
-      ),
-      session
-    );
-  }
-
-  await interaction.reply({
-    content:
-      `✅ Tên panel: **${displayName}**`,
-    ephemeral: true
-  });
-
-  deleteReplyLater(
-    interaction,
-    SUCCESS_DELETE_MS
-  );
-}
-
-async function findOrCreateVoiceCategory(
-  guild,
-  current
-) {
-  if (
-    current?.category_id
-  ) {
-    const existing =
-      await guild.channels
-        .fetch(
-          current.category_id
-        )
-        .catch(() => null);
-
-    if (
-      existing &&
-      existing.type ===
-        ChannelType.GuildCategory
-    ) {
-      return existing;
-    }
-  }
-
-  return guild.channels.create({
-    name: 'VOICE HDK',
-    type: ChannelType.GuildCategory,
-    reason:
-      'Voice HDK Temp Voice'
-  });
-}
-
-async function deleteOldCreatePanel(
-  guild,
-  generator,
-  keepMessageId = null
-) {
-  if (
-    !generator?.setup_channel_id ||
-    !generator?.setup_message_id
-  ) {
-    return;
-  }
-
-  if (
-    keepMessageId &&
+  clearPendingTransfer(
     String(
-      generator.setup_message_id
-    ) ===
-    String(keepMessageId)
-  ) {
-    return;
-  }
-
-  const oldChannel =
-    await guild.channels
-      .fetch(
-        generator.setup_channel_id
-      )
-      .catch(() => null);
-
-  if (
-    !oldChannel ||
-    !oldChannel.isTextBased()
-  ) {
-    return;
-  }
-
-  const oldMessage =
-    await oldChannel.messages
-      .fetch(
-        generator.setup_message_id
-      )
-      .catch(() => null);
-
-  if (
-    oldMessage?.author?.id ===
-    client.user.id
-  ) {
-    await oldMessage
-      .delete()
-      .catch(() => {});
-  }
-}
-
-async function handleSetupConfirm(
-  interaction
-) {
-  if (!interaction.guild) {
-    return;
-  }
-
-  if (
-    !interaction.memberPermissions?.has(
-      PermissionsBitField.Flags.ManageGuild
+      channelId
     )
-  ) {
-    return tempReply(
-      interaction,
-      '⛔ Bạn không có quyền thiết lập.',
-      {
-        error: true
-      }
-    );
-  }
+  );
 
-  const session =
-    getSetupSession(
-      interaction.guild.id,
-      interaction.user.id
-    );
-
-  if (!session) {
-    return tempReply(
-      interaction,
-      '⌛ Phiên thiết lập đã hết hạn. Hãy dùng /setup lại.',
-      {
-        error: true
-      }
-    );
-  }
-
-  if (!session.channelId) {
-    return tempReply(
-      interaction,
-      '📍 Hãy chọn kênh đặt nút Tạo phòng.',
-      {
-        error: true
-      }
-    );
-  }
-
-  if (!session.displayName) {
-    return tempReply(
-      interaction,
-      '✏️ Hãy đặt tên hiển thị cho panel.',
-      {
-        error: true
-      }
-    );
-  }
-
-  await interaction.deferReply({
-    ephemeral: true
-  });
-
-  const setupChannel =
-    await interaction.guild.channels
-      .fetch(
-        session.channelId
-      )
-      .catch(() => null);
-
-  if (
-    !setupChannel ||
-    !setupChannel.isTextBased()
-  ) {
-    return tempReply(
-      interaction,
-      '❌ Kênh thiết lập không còn tồn tại.',
-      {
-        error: true
-      }
-    );
-  }
-
-  const missing =
-    getMissingPermissions(
-      interaction.guild,
-      setupChannel
-    );
-
-  const setupRequired = [
-    PermissionsBitField.Flags.ViewChannel,
-    PermissionsBitField.Flags.SendMessages,
-    PermissionsBitField.Flags.EmbedLinks,
-    PermissionsBitField.Flags.ReadMessageHistory
-  ];
-
-  const setupMissing =
-    setupRequired.filter(
-      permission =>
-        missing.includes(
-          permission
-        )
-    );
-
-  if (setupMissing.length) {
-    return tempReply(
-      interaction,
-      '❌ Voice HDK thiếu quyền tại kênh đã chọn: ' +
-      permissionNames(
-        setupMissing
-      ).join(', '),
-      {
-        error: true
-      }
-    );
-  }
-
-  const current =
-    await getGenerator(
-      interaction.guild.id
-    );
-
-  const category =
-    await findOrCreateVoiceCategory(
-      interaction.guild,
-      current
-    );
-
-  let createMessage = null;
-
-  if (
-    current?.setup_channel_id &&
-    current?.setup_message_id &&
+  clearSelectionsForChannel(
     String(
-      current.setup_channel_id
-    ) ===
-    String(setupChannel.id)
-  ) {
-    const existing =
-      await setupChannel.messages
-        .fetch(
-          current.setup_message_id
-        )
-        .catch(() => null);
+      room.guild_id
+    ),
+    String(
+      channelId
+    )
+  );
 
-    if (
-      existing?.author?.id ===
-      client.user.id
-    ) {
-      createMessage =
-        await existing.edit(
-          buildCreateRoomPanel()
+  if (guild) {
+    let channel =
+      guild.channels.cache.get(
+        String(
+          channelId
+        )
+      );
+
+    if (!channel) {
+      channel =
+        await guild.channels.fetch(
+          String(
+            channelId
+          )
+        ).catch(
+          () => null
         );
     }
+
+    if (channel) {
+      try {
+        await channel.delete(
+          reason
+        );
+      } catch (error) {
+        logError(
+          'DELETE_ROOM_CHANNEL',
+          error
+        );
+
+        throw error;
+      }
+    }
   }
 
-  if (!createMessage) {
-    createMessage =
-      await setupChannel.send(
-        buildCreateRoomPanel()
-      );
-  }
-
-  await saveGenerator({
-    guildId:
-      interaction.guild.id,
-
-    categoryId:
-      category.id,
-
-    generatorId:
-      null,
-
-    blogChannelId:
-      current?.blog_channel_id ||
-      null,
-
-    trackedTextChannelId:
-      current?.tracked_text_channel_id ||
-      null,
-
-    setupChannelId:
-      setupChannel.id,
-
-    setupMessageId:
-      createMessage.id,
-
-    displayName:
-      session.displayName
-  });
-
-  if (
-    current?.setup_message_id &&
+  await deleteRoomRecord(
     String(
-      current.setup_message_id
-    ) !==
-    String(createMessage.id)
-  ) {
-    await deleteOldCreatePanel(
-      interaction.guild,
-      current,
-      createMessage.id
-    );
-  }
-
-  clearSetupSession(
-    interaction.guild.id,
-    interaction.user.id
+      channelId
+    )
   );
 
-  await tempReply(
-    interaction,
-    `✅ Thiết lập hoàn tất tại <#${setupChannel.id}>.`
-  );
+  return true;
 }
 
-async function createTempRoom(
-  guild,
-  member
+function scheduleEmptyRoomCheck(
+  channelId,
+  delay = 2500
 ) {
-  const generator =
-    await getGenerator(
-      guild.id
+  const timer =
+    setTimeout(
+      async () => {
+        try {
+          const room =
+            await getRoom(
+              channelId
+            );
+
+          if (!room) {
+            return;
+          }
+
+          const guild =
+            client.guilds.cache.get(
+              String(
+                room.guild_id
+              )
+            );
+
+          if (!guild) {
+            return;
+          }
+
+          let channel =
+            guild.channels.cache.get(
+              String(
+                channelId
+              )
+            );
+
+          if (!channel) {
+            channel =
+              await guild.channels.fetch(
+                String(
+                  channelId
+                )
+              ).catch(
+                () => null
+              );
+          }
+
+          if (!channel) {
+            await deleteRoomRecord(
+              String(
+                channelId
+              )
+            );
+
+            return;
+          }
+
+          if (
+            channel.type !==
+            ChannelType.GuildVoice
+          ) {
+            return;
+          }
+
+          const humans =
+            channel.members.filter(
+              member =>
+                !member.user.bot
+            );
+
+          if (
+            humans.size > 0
+          ) {
+            return;
+          }
+
+          await deleteManagedRoom(
+            channel.id,
+            `${BOT_NAME}: phòng trống`
+          );
+        } catch (error) {
+          logError(
+            'EMPTY_ROOM_CHECK',
+            error
+          );
+        }
+      },
+      delay
     );
+
+  timer.unref?.();
+}
+
+async function getVoiceRoomParent(
+  guild,
+  generator
+) {
+  const categoryId =
+    generator?.button_category_id;
 
   if (
-    !generator ||
-    !generator.setup_channel_id
+    !isSnowflake(
+      String(categoryId)
+    )
   ) {
-    throw new Error(
-      'Máy chủ chưa thiết lập Voice HDK.'
-    );
+    return null;
   }
 
-  const existingRecord =
-    await getOwnedRoom(
-      guild.id,
-      member.id
+  let category =
+    guild.channels.cache.get(
+      String(
+        categoryId
+      )
     );
 
-  if (existingRecord) {
-    const existingChannel =
-      await guild.channels
-        .fetch(
-          existingRecord.channel_id
-        )
-        .catch(() => null);
-
-    if (
-      existingChannel &&
-      existingChannel.type ===
-        ChannelType.GuildVoice
-    ) {
-      return {
-        channel:
-          existingChannel,
-
-        created: false
-      };
-    }
-
-    await deleteRoomRecord(
-      existingRecord.channel_id
-    );
-  }
-
-  let category = null;
-
-  if (
-    generator.category_id
-  ) {
+  if (!category) {
     category =
-      await guild.channels
-        .fetch(
-          generator.category_id
+      await guild.channels.fetch(
+        String(
+          categoryId
         )
-        .catch(() => null);
+      ).catch(
+        () => null
+      );
   }
 
   if (
@@ -2993,401 +4433,423 @@ async function createTempRoom(
     category.type !==
       ChannelType.GuildCategory
   ) {
-    category =
-      await guild.channels.create({
-        name: 'VOICE HDK',
-        type:
-          ChannelType.GuildCategory,
-        reason:
-          'Voice HDK Temp Voice'
-      });
-
-    await pool.query(
-      `
-        UPDATE generators
-        SET category_id=$1
-        WHERE guild_id=$2
-      `,
-      [
-        category.id,
-        guild.id
-      ]
-    );
+    return null;
   }
 
-  const roomName =
-    cleanRoomName(
-      member.displayName ||
-      member.user.username
-    );
+  return category;
+}
 
-  const channel =
-    await guild.channels.create({
-      name:
-        `${ROOM_PREFIX}${roomName}`,
+async function createTempRoom(
+  guild,
+  member
+) {
+  return withCreateLock(
+    guild.id,
+    member.id,
+    async () => {
+      const generator =
+        await getGenerator(
+          guild.id
+        );
 
-      type:
-        ChannelType.GuildVoice,
+      if (!generator) {
+        throw new Error(
+          'Voice HDK chưa được cài đặt trong server này.'
+        );
+      }
 
-      parent:
-        category.id,
+      const category =
+        await getVoiceRoomParent(
+          guild,
+          generator
+        );
 
-      userLimit: 0,
+      if (!category) {
+        throw new Error(
+          'Danh mục đặt nút không còn tồn tại.'
+        );
+      }
 
-      reason:
-        `Voice HDK - phòng của ${member.user.username}`,
+      const existing =
+        await getOwnedRoom(
+          guild.id,
+          member.id
+        );
 
-      permissionOverwrites: [
-        {
-          id:
-            guild.roles.everyone.id,
+      if (existing) {
+        let existingChannel =
+          guild.channels.cache.get(
+            String(
+              existing.channel_id
+            )
+          );
 
-          allow: [
-            PermissionsBitField
-              .Flags
-              .ViewChannel,
-
-            PermissionsBitField
-              .Flags
-              .Connect
-          ]
-        },
-        {
-          id:
-            member.id,
-
-          allow: [
-            PermissionsBitField
-              .Flags
-              .ViewChannel,
-
-            PermissionsBitField
-              .Flags
-              .Connect,
-
-            PermissionsBitField
-              .Flags
-              .Speak,
-
-            PermissionsBitField
-              .Flags
-              .Stream,
-
-            PermissionsBitField
-              .Flags
-              .UseVAD,
-
-            PermissionsBitField
-              .Flags
-              .SendMessages,
-
-            PermissionsBitField
-              .Flags
-              .ReadMessageHistory
-          ]
-        },
-        {
-          id:
-            guild.members.me.id,
-
-          allow: [
-            PermissionsBitField
-              .Flags
-              .ViewChannel,
-
-            PermissionsBitField
-              .Flags
-              .Connect,
-
-            PermissionsBitField
-              .Flags
-              .SendMessages,
-
-            PermissionsBitField
-              .Flags
-              .EmbedLinks,
-
-            PermissionsBitField
-              .Flags
-              .ReadMessageHistory,
-
-            PermissionsBitField
-              .Flags
-              .ManageChannels,
-
-            PermissionsBitField
-              .Flags
-              .ManageRoles,
-
-            PermissionsBitField
-              .Flags
-              .MoveMembers
-          ]
+        if (!existingChannel) {
+          existingChannel =
+            await guild.channels.fetch(
+              String(
+                existing.channel_id
+              )
+            ).catch(
+              () => null
+            );
         }
-      ]
-    });
 
-  try {
-    await saveRoom({
-      guildId:
-        guild.id,
+        if (
+          existingChannel &&
+          existingChannel.type ===
+            ChannelType.GuildVoice
+        ) {
+          return {
+            channel:
+              existingChannel,
+            created:
+              false
+          };
+        }
 
-      channelId:
-        channel.id,
+        await deleteRoomRecord(
+          String(
+            existing.channel_id
+          )
+        );
+      }
 
-      ownerId:
-        member.id,
+      const botMember =
+        await getBotMember(
+          guild
+        );
 
-      categoryId:
-        category.id
-    });
+      if (!botMember) {
+        throw new Error(
+          'Không tìm thấy bot trong server.'
+        );
+      }
 
-    await ensureBotRoomPermissions(
-      channel
-    );
+      let channel = null;
 
-    await grantOwnerPermissions(
-      channel,
-      member.id
-    );
+      try {
+        channel =
+          await guild.channels.create({
+            name:
+              `${ROOM_PREFIX}${cleanRoomName(
+                safeMemberName(
+                  member
+                )
+              )}`,
+            type:
+              ChannelType.GuildVoice,
+            parent:
+              category.id,
+            reason:
+              `${BOT_NAME}: ${safeMemberName(member)} tạo phòng`,
+            permissionOverwrites: [
+              {
+                id:
+                  guild.roles.everyone.id,
+                allow: [
+                  PermissionsBitField.Flags.ViewChannel,
+                  PermissionsBitField.Flags.Connect
+                ]
+              },
+              {
+                id:
+                  member.id,
+                allow: [
+                  PermissionsBitField.Flags.ViewChannel,
+                  PermissionsBitField.Flags.Connect
+                ]
+              },
+              {
+                id:
+                  botMember.id,
+                allow: [
+                  PermissionsBitField.Flags.ViewChannel,
+                  PermissionsBitField.Flags.Connect,
+                  PermissionsBitField.Flags.SendMessages,
+                  PermissionsBitField.Flags.ReadMessageHistory,
+                  PermissionsBitField.Flags.ManageChannels,
+                  PermissionsBitField.Flags.ManageRoles,
+                  PermissionsBitField.Flags.MoveMembers
+                ]
+              }
+            ]
+          });
 
-    await refreshRoomPanel(
-      channel.id
-    );
+        try {
+          await saveRoom({
+            guildId:
+              guild.id,
+            channelId:
+              channel.id,
+            ownerId:
+              member.id,
+            categoryId:
+              category.id
+          });
+        } catch (error) {
+          if (
+            error?.code ===
+            '23505'
+          ) {
+            try {
+              await channel.delete(
+                `${BOT_NAME}: phòng trùng`
+              );
+            } catch {
+            }
 
-    return {
-      channel,
-      created: true
-    };
-  } catch (error) {
-    await deleteRoomRecord(
-      channel.id
-    ).catch(() => {});
+            const racedRoom =
+              await getOwnedRoom(
+                guild.id,
+                member.id
+              );
 
-    await channel
-      .delete(
-        'Rollback vì tạo Temp Voice thất bại'
-      )
-      .catch(() => {});
+            if (racedRoom) {
+              const racedChannel =
+                guild.channels.cache.get(
+                  String(
+                    racedRoom.channel_id
+                  )
+                ) ||
+                await guild.channels.fetch(
+                  String(
+                    racedRoom.channel_id
+                  )
+                ).catch(
+                  () => null
+                );
 
-    throw error;
-  }
+              if (
+                racedChannel &&
+                racedChannel.type ===
+                  ChannelType.GuildVoice
+              ) {
+                return {
+                  channel:
+                    racedChannel,
+                  created:
+                    false
+                };
+              }
+            }
+          }
+
+          throw error;
+        }
+
+        await ensureBotRoomPermissions(
+          channel
+        );
+
+        await grantOwnerPermissions(
+          channel,
+          member.id
+        );
+
+        await refreshRoomPanelSafe(
+          channel.id
+        );
+
+        return {
+          channel,
+          created:
+            true
+        };
+      } catch (error) {
+        if (channel) {
+          const saved =
+            await getRoom(
+              channel.id
+            ).catch(
+              () => null
+            );
+
+          if (!saved) {
+            try {
+              await channel.delete(
+                `${BOT_NAME}: hoàn tác tạo phòng lỗi`
+              );
+            } catch {
+            }
+          }
+        }
+
+        throw error;
+      }
+    }
+  );
 }
 
 async function handleCreateRoomButton(
   interaction
 ) {
-  if (!interaction.guild) {
+  await safeDeferReply(
+    interaction,
+    true
+  );
+
+  if (
+    !interaction.guild
+  ) {
+    await tempReply(
+      interaction,
+      '❌ Không tìm thấy server.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const generator =
+    await getGenerator(
+      interaction.guild.id
+    );
+
+  if (!generator) {
+    await tempReply(
+      interaction,
+      '❌ Voice HDK chưa được cài đặt trong server này.',
+      {
+        error: true
+      }
+    );
+
     return;
   }
 
   if (
-    !useCooldown(
-      interaction.user.id,
-      'create_room'
-    )
+    String(
+      generator.create_channel_id ||
+      ''
+    ) !==
+    interaction.channelId
   ) {
-    return tempReply(
+    await tempReply(
       interaction,
-      '⏳ Thao tác quá nhanh.',
+      '❌ Nút tạo phòng này không còn thuộc hệ thống Voice HDK hiện tại.',
       {
         error: true
       }
     );
+
+    return;
   }
 
-  await interaction.deferReply({
-    ephemeral: true
-  });
+  const cooldown =
+    useCooldown(
+      interaction.user.id,
+      'create_room',
+      3000
+    );
+
+  if (cooldown) {
+    await tempReply(
+      interaction,
+      '⏳ Vui lòng chờ một chút trước khi tạo phòng.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
 
   const member =
-    await interaction.guild.members
-      .fetch(
-        interaction.user.id
-      )
-      .catch(() => null);
+    await getGuildMember(
+      interaction.guild,
+      interaction.user.id
+    );
 
   if (!member) {
-    return tempReply(
+    await tempReply(
       interaction,
-      '❌ Không tìm thấy bạn trong máy chủ.',
+      '❌ Không tìm thấy thông tin thành viên của bạn.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  try {
+    const result =
+      await createTempRoom(
+        interaction.guild,
+        member
+      );
+
+    const channel =
+      result.channel;
+
+    if (
+      member.voice?.channelId
+    ) {
+      if (
+        member.voice.channelId !==
+        channel.id
+      ) {
+        try {
+          await member.voice.setChannel(
+            channel,
+            `${BOT_NAME}: chuyển chủ phòng vào phòng riêng`
+          );
+        } catch (error) {
+          logError(
+            'MOVE_OWNER_TO_ROOM',
+            error
+          );
+        }
+      }
+    }
+
+    if (
+      result.created
+    ) {
+      await tempReply(
+        interaction,
+        `✅ Đã tạo phòng ${channel}.`
+      );
+    } else {
+      await tempReply(
+        interaction,
+        `🔊 Bạn đã có phòng ${channel}.`
+      );
+    }
+  } catch (error) {
+    logError(
+      'CREATE_ROOM_BUTTON',
+      error
+    );
+
+    await tempReply(
+      interaction,
+      `❌ Không thể tạo phòng: ${String(
+        error?.message ||
+        'Lỗi không xác định.'
+      ).slice(0, 1000)}`,
       {
         error: true
       }
     );
   }
-
-  const result =
-    await createTempRoom(
-      interaction.guild,
-      member
-    );
-
-  if (!result.created) {
-    if (
-      member.voice.channelId &&
-      member.voice.channelId !==
-        result.channel.id
-    ) {
-      await member.voice
-        .setChannel(
-          result.channel
-        )
-        .catch(() => {});
-    }
-
-    return tempReply(
-      interaction,
-      `🔊 Bạn đã có phòng: <#${result.channel.id}>`
-    );
-  }
-
-  if (member.voice.channelId) {
-    try {
-      await member.voice.setChannel(
-        result.channel
-      );
-    } catch (error) {
-      logError(
-        'MOVE_OWNER_NEW_ROOM',
-        error,
-        {
-          guildId:
-            interaction.guild.id,
-
-          userId:
-            member.id,
-
-          channelId:
-            result.channel.id
-        }
-      );
-    }
-  }
-
-  await tempReply(
-    interaction,
-    `🔊 Phòng của bạn đã được tạo: <#${result.channel.id}>`
-  );
 }
 
-async function deleteTempRoom(
-  channel,
-  reason =
-    'Temp Voice không còn người'
-) {
-  if (!channel) {
-    return;
-  }
-
-  const room =
-    await getRoom(
-      channel.id
-    );
-
-  if (!room) {
-    return;
-  }
-
-  clearSelectedMember(
-    channel.id
-  );
-
-  clearPendingTransfer(
-    channel.id
-  );
-
-  await deleteRoomRecord(
-    channel.id
-  );
-
-  await channel
-    .delete(reason)
-    .catch(error => {
-      logError(
-        'DELETE_TEMP_ROOM',
-        error,
-        {
-          channelId:
-            channel.id
-        }
-      );
-    });
-}
-
-function scheduleEmptyRoomCheck(
-  channelId
-) {
-  const timer = setTimeout(
-    async () => {
-      try {
-        const channel =
-          await client.channels
-            .fetch(channelId)
-            .catch(() => null);
-
-        if (
-          !channel ||
-          channel.type !==
-            ChannelType.GuildVoice
-        ) {
-          return;
-        }
-
-        const room =
-          await getRoom(
-            channel.id
-          );
-
-        if (!room) {
-          return;
-        }
-
-        const humans =
-          channel.members.filter(
-            member =>
-              !member.user.bot
-          );
-
-        if (
-          humans.size === 0
-        ) {
-          await deleteTempRoom(
-            channel,
-            'Temp Voice trống'
-          );
-        }
-      } catch (error) {
-        logError(
-          'EMPTY_ROOM_CHECK',
-          error,
-          {
-            channelId
-          }
-        );
-      }
-    },
-    2500
-  );
-
-  timer.unref?.();
-}
 async function getOwnerRoomContext(
   interaction
 ) {
   if (
     !interaction.guild ||
-    !interaction.channelId
+    !interaction.channel
   ) {
-    await tempReply(
-      interaction,
-      '❌ Không xác định được phòng.',
-      {
-        error: true
-      }
-    );
-
-    return null;
+    return {
+      ok: false,
+      message:
+        'Không tìm thấy server hoặc phòng.'
+    };
   }
 
   const room =
@@ -3396,220 +4858,79 @@ async function getOwnerRoomContext(
     );
 
   if (!room) {
-    await tempReply(
-      interaction,
-      '❌ Đây không phải phòng Temp Voice.',
-      {
-        error: true
-      }
-    );
-
-    return null;
-  }
-
-  const channel =
-    await interaction.guild.channels
-      .fetch(
-        interaction.channelId
-      )
-      .catch(() => null);
-
-  if (
-    !channel ||
-    channel.type !==
-      ChannelType.GuildVoice
-  ) {
-    await tempReply(
-      interaction,
-      '❌ Phòng thoại không còn tồn tại.',
-      {
-        error: true
-      }
-    );
-
-    return null;
+    return {
+      ok: false,
+      message:
+        'Đây không phải phòng Voice HDK đang được quản lý.'
+    };
   }
 
   if (
-    String(room.owner_id) !==
-    String(interaction.user.id)
+    String(
+      room.guild_id
+    ) !==
+    interaction.guild.id
   ) {
-    await tempReply(
-      interaction,
-      '⛔ Chỉ chủ phòng mới dùng được chức năng này.',
-      {
-        error: true
-      }
-    );
-
-    return null;
+    return {
+      ok: false,
+      message:
+        'Dữ liệu phòng không khớp với server.'
+    };
   }
 
-  const member =
-    await interaction.guild.members
-      .fetch(
-        interaction.user.id
-      )
-      .catch(() => null);
+  if (
+    String(
+      room.owner_id
+    ) !==
+    interaction.user.id
+  ) {
+    return {
+      ok: false,
+      message:
+        'Chỉ chủ phòng hiện tại mới được sử dụng chức năng này.'
+    };
+  }
 
   if (
-    !member ||
-    member.voice.channelId !==
-      channel.id
+    interaction.channel.type !==
+    ChannelType.GuildVoice
   ) {
-    await tempReply(
-      interaction,
-      '❌ Bạn phải ở trong phòng của mình để điều khiển.',
-      {
-        error: true
-      }
-    );
-
-    return null;
+    return {
+      ok: false,
+      message:
+        'Kênh hiện tại không còn là phòng Voice hợp lệ.'
+    };
   }
 
   return {
+    ok: true,
     room,
-    channel,
-    member
+    channel:
+      interaction.channel
   };
-}
-
-async function resolveSelectedMember(
-  interaction,
-  room,
-  channel,
-  {
-    mustBeInRoom = false
-  } = {}
-) {
-  const targetId =
-    getSelectedMember(
-      channel.id,
-      room.owner_id
-    );
-
-  if (!targetId) {
-    await tempReply(
-      interaction,
-      '👤 Hãy chọn thành viên trước.',
-      {
-        error: true
-      }
-    );
-
-    return null;
-  }
-
-  if (
-    String(targetId) ===
-    String(room.owner_id)
-  ) {
-    clearSelectedMember(
-      channel.id
-    );
-
-    await tempReply(
-      interaction,
-      '❌ Không thể chọn chính bạn.',
-      {
-        error: true
-      }
-    );
-
-    return null;
-  }
-
-  if (
-    String(targetId) ===
-    String(client.user.id)
-  ) {
-    clearSelectedMember(
-      channel.id
-    );
-
-    await tempReply(
-      interaction,
-      '❌ Không thể chọn Voice HDK.',
-      {
-        error: true
-      }
-    );
-
-    return null;
-  }
-
-  const target =
-    await interaction.guild.members
-      .fetch(targetId)
-      .catch(() => null);
-
-  if (!target) {
-    clearSelectedMember(
-      channel.id
-    );
-
-    await tempReply(
-      interaction,
-      '❌ Thành viên không còn trong máy chủ.',
-      {
-        error: true
-      }
-    );
-
-    return null;
-  }
-
-  if (
-    target.user.bot
-  ) {
-    clearSelectedMember(
-      channel.id
-    );
-
-    await tempReply(
-      interaction,
-      '❌ Không thể thực hiện thao tác này với bot.',
-      {
-        error: true
-      }
-    );
-
-    return null;
-  }
-
-  if (
-    mustBeInRoom &&
-    target.voice.channelId !==
-      channel.id
-  ) {
-    clearSelectedMember(
-      channel.id
-    );
-
-    await tempReply(
-      interaction,
-      '❌ Thành viên không còn ở trong phòng.',
-      {
-        error: true
-      }
-    );
-
-    return null;
-  }
-
-  return target;
 }
 
 async function handleMemberSelect(
   interaction
 ) {
+  await safeDeferUpdate(
+    interaction
+  );
+
   const context =
     await getOwnerRoomContext(
       interaction
     );
 
-  if (!context) {
+  if (!context.ok) {
+    await tempFollowUp(
+      interaction,
+      `❌ ${context.message}`,
+      {
+        error: true
+      }
+    );
+
     return;
   }
 
@@ -3617,329 +4938,311 @@ async function handleMemberSelect(
     interaction.values?.[0];
 
   if (
-    !targetId ||
-    !isSnowflake(targetId)
+    !isSnowflake(
+      String(
+        targetId
+      )
+    )
   ) {
-    return tempReply(
+    await tempFollowUp(
       interaction,
-      '❌ Thành viên đã chọn không hợp lệ.',
+      '❌ Thành viên được chọn không hợp lệ.',
       {
         error: true
       }
     );
+
+    return;
   }
 
   if (
-    String(targetId) ===
-    String(interaction.user.id)
+    targetId ===
+    interaction.user.id
   ) {
     clearSelectedMember(
-      context.channel.id
+      interaction.guild.id,
+      interaction.channelId,
+      interaction.user.id
     );
 
-    return tempReply(
+    await tempFollowUp(
       interaction,
-      '❌ Không cần chọn chính bạn.',
+      '❌ Bạn không cần chọn chính mình.',
       {
         error: true
       }
     );
+
+    return;
   }
 
   const target =
-    await interaction.guild.members
-      .fetch(targetId)
-      .catch(() => null);
-
-  if (!target) {
-    clearSelectedMember(
-      context.channel.id
+    await getGuildMember(
+      interaction.guild,
+      targetId
     );
 
-    return tempReply(
+  if (
+    !target ||
+    target.user.bot
+  ) {
+    clearSelectedMember(
+      interaction.guild.id,
+      interaction.channelId,
+      interaction.user.id
+    );
+
+    await tempFollowUp(
       interaction,
-      '❌ Người này không phải thành viên của máy chủ.',
+      '❌ Hãy chọn một thành viên hợp lệ trong server.',
       {
         error: true
       }
     );
-  }
 
-  if (target.user.bot) {
-    clearSelectedMember(
-      context.channel.id
-    );
-
-    return tempReply(
-      interaction,
-      '❌ Không thể chọn bot.',
-      {
-        error: true
-      }
-    );
+    return;
   }
 
   setSelectedMember(
-    context.channel.id,
-    context.room.owner_id,
+    interaction.guild.id,
+    interaction.channelId,
+    interaction.user.id,
     target.id
   );
-
-  // Không gửi "Đã chọn thành viên".
-  // Không refresh panel ở đây.
-  // Chỉ xác nhận interaction để Discord không báo lỗi
-  // và hạn chế tối đa việc màn hình chat bị nhảy.
-  await interaction.deferUpdate();
 }
-
-function buildRenameModal(
-  channel
-) {
-  const currentName =
-    cleanRoomName(
-      channel.name
-    );
-
-  const input =
-    new TextInputBuilder()
-      .setCustomId(
-        'vc_rename_value'
-      )
-      .setLabel(
-        'Tên phòng mới'
-      )
-      .setStyle(
-        TextInputStyle.Short
-      )
-      .setRequired(true)
-      .setMinLength(1)
-      .setMaxLength(80)
-      .setValue(
-        currentName.slice(
-          0,
-          80
-        )
-      );
-
-  return new ModalBuilder()
-    .setCustomId(
-      'vc_rename_modal'
-    )
-    .setTitle(
-      'Đổi tên phòng'
-    )
-    .addComponents(
-      new ActionRowBuilder()
-        .addComponents(input)
-    );
-}
-
-function buildLimitModal(
-  channel
-) {
-  const input =
-    new TextInputBuilder()
-      .setCustomId(
-        'vc_limit_value'
-      )
-      .setLabel(
-        'Giới hạn thành viên'
-      )
-      .setPlaceholder(
-        '0 = Không giới hạn'
-      )
-      .setStyle(
-        TextInputStyle.Short
-      )
-      .setRequired(true)
-      .setMinLength(1)
-      .setMaxLength(2)
-      .setValue(
-        String(
-          channel.userLimit || 0
-        )
-      );
-
-  return new ModalBuilder()
-    .setCustomId(
-      'vc_limit_modal'
-    )
-    .setTitle(
-      'Giới hạn phòng'
-    )
-    .addComponents(
-      new ActionRowBuilder()
-        .addComponents(input)
-    );
-}
-
-function buildResetConfirmation() {
-  const embed =
-    new EmbedBuilder()
-      .setColor(0xFEE75C)
-      .setDescription(
-        [
-          '**♻️ Đặt lại phòng?**',
-          '',
-          'Phòng sẽ trở về:',
-          '🔓 Mở',
-          '👁 Công khai',
-          '👥 Không giới hạn',
-          '🌐 Khu vực tự động',
-          '',
-          'Quyền Mời/Cấm riêng của thành viên cũng sẽ được xóa.'
-        ].join('\n')
-      );
-
-  const row =
-    new ActionRowBuilder()
-      .addComponents(
-        new ButtonBuilder()
-          .setCustomId(
-            'vc_reset_confirm'
-          )
-          .setLabel(
-            'Đặt lại'
-          )
-          .setEmoji('♻️')
-          .setStyle(
-            ButtonStyle.Danger
-          ),
-
-        new ButtonBuilder()
-          .setCustomId(
-            'vc_reset_cancel'
-          )
-          .setLabel(
-            'Hủy'
-          )
-          .setStyle(
-            ButtonStyle.Secondary
-          )
-      );
-
-  return {
-    embeds: [embed],
-    components: [row]
-  };
-}
-
-async function handleLockButton(
+async function getRequiredSelectedMember(
   interaction,
-  locked
+  context
 ) {
+  const member =
+    await getSelectedMember(
+      interaction.guild,
+      interaction.channelId,
+      interaction.user.id
+    );
+
+  if (!member) {
+    await tempFollowUp(
+      interaction,
+      '❌ Hãy chọn thành viên ở menu **👤 Chọn thành viên** trước.',
+      {
+        error: true
+      }
+    );
+
+    return null;
+  }
+
+  if (
+    member.id ===
+    String(
+      context.room.owner_id
+    )
+  ) {
+    clearSelectedMember(
+      interaction.guild.id,
+      interaction.channelId,
+      interaction.user.id
+    );
+
+    await tempFollowUp(
+      interaction,
+      '❌ Không thể thực hiện thao tác này với chính chủ phòng.',
+      {
+        error: true
+      }
+    );
+
+    return null;
+  }
+
+  return member;
+}
+
+async function handleRoomLock(
+  interaction
+) {
+  await safeDeferUpdate(
+    interaction
+  );
+
   const context =
     await getOwnerRoomContext(
       interaction
     );
 
-  if (!context) {
-    return;
-  }
-
-  if (
-    !useCooldown(
-      interaction.user.id,
-      locked
-        ? 'lock'
-        : 'unlock'
-    )
-  ) {
-    return tempReply(
+  if (!context.ok) {
+    await tempFollowUp(
       interaction,
-      '⏳ Thao tác quá nhanh.',
+      `❌ ${context.message}`,
       {
         error: true
       }
     );
+
+    return;
   }
 
-  await interaction.deferUpdate();
-
-  const currentState =
-    getRoomState(
-      context.channel
+  const cooldown =
+    useCooldown(
+      interaction.user.id,
+      `lock:${interaction.channelId}`
     );
 
-  if (
-    currentState.locked !==
-    locked
-  ) {
+  if (cooldown) {
+    await tempFollowUp(
+      interaction,
+      '⏳ Thao tác quá nhanh, vui lòng thử lại.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  try {
+    const state =
+      getRoomState(
+        context.channel
+      );
+
+    const nextLocked =
+      !state.locked;
+
     await setRoomLocked(
       context.channel,
-      locked
-    );
-  }
-
-  await refreshRoomPanelSafe(
-    context.channel.id
-  );
-
-  await tempFollowUp(
-    interaction,
-    locked
-      ? '🔒 Đã khóa phòng.'
-      : '🔓 Đã mở phòng.'
-  );
-}
-
-async function handleHideButton(
-  interaction,
-  hidden
-) {
-  const context =
-    await getOwnerRoomContext(
-      interaction
+      nextLocked
     );
 
-  if (!context) {
-    return;
-  }
+    await refreshRoomPanelSafe(
+      context.channel.id
+    );
 
-  if (
-    !useCooldown(
-      interaction.user.id,
-      hidden
-        ? 'hide'
-        : 'show'
-    )
-  ) {
-    return tempReply(
+    await sendActionLog(
+      interaction.guild,
+      nextLocked
+        ? '🔒'
+        : '🔓',
+      interaction.member,
+      nextLocked
+        ? `Khóa phòng ${context.channel.name}`
+        : `Mở phòng ${context.channel.name}`
+    );
+
+    await tempFollowUp(
       interaction,
-      '⏳ Thao tác quá nhanh.',
+      nextLocked
+        ? '🔒 Đã khóa phòng.'
+        : '🔓 Đã mở phòng.'
+    );
+  } catch (error) {
+    logError(
+      'ROOM_LOCK',
+      error
+    );
+
+    await tempFollowUp(
+      interaction,
+      '❌ Không thể thay đổi trạng thái khóa phòng.',
       {
         error: true
       }
     );
   }
+}
 
-  await interaction.deferUpdate();
+async function handleRoomHide(
+  interaction
+) {
+  await safeDeferUpdate(
+    interaction
+  );
 
-  const currentState =
-    getRoomState(
-      context.channel
+  const context =
+    await getOwnerRoomContext(
+      interaction
     );
 
-  if (
-    currentState.hidden !==
-    hidden
-  ) {
-    await setRoomHidden(
-      context.channel,
-      hidden
+  if (!context.ok) {
+    await tempFollowUp(
+      interaction,
+      `❌ ${context.message}`,
+      {
+        error: true
+      }
     );
+
+    return;
   }
 
-  await refreshRoomPanelSafe(
-    context.channel.id
-  );
+  const cooldown =
+    useCooldown(
+      interaction.user.id,
+      `hide:${interaction.channelId}`
+    );
 
-  await tempFollowUp(
-    interaction,
-    hidden
-      ? '🙈 Đã ẩn phòng.'
-      : '👁️ Đã hiện phòng.'
-  );
+  if (cooldown) {
+    await tempFollowUp(
+      interaction,
+      '⏳ Thao tác quá nhanh, vui lòng thử lại.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  try {
+    const state =
+      getRoomState(
+        context.channel
+      );
+
+    const nextHidden =
+      !state.hidden;
+
+    await setRoomHidden(
+      context.channel,
+      nextHidden
+    );
+
+    await refreshRoomPanelSafe(
+      context.channel.id
+    );
+
+    await sendActionLog(
+      interaction.guild,
+      nextHidden
+        ? '🙈'
+        : '👁️',
+      interaction.member,
+      nextHidden
+        ? `Ẩn phòng ${context.channel.name}`
+        : `Hiện phòng ${context.channel.name}`
+    );
+
+    await tempFollowUp(
+      interaction,
+      nextHidden
+        ? '🙈 Đã ẩn phòng.'
+        : '👁️ Đã hiện phòng.'
+    );
+  } catch (error) {
+    logError(
+      'ROOM_HIDE',
+      error
+    );
+
+    await tempFollowUp(
+      interaction,
+      '❌ Không thể thay đổi trạng thái hiển thị của phòng.',
+      {
+        error: true
+      }
+    );
+  }
 }
 
 async function handleRenameButton(
@@ -3950,78 +5253,161 @@ async function handleRenameButton(
       interaction
     );
 
-  if (!context) {
+  if (!context.ok) {
+    await tempReply(
+      interaction,
+      `❌ ${context.message}`,
+      {
+        error: true
+      }
+    );
+
     return;
   }
 
+  const modal =
+    new ModalBuilder()
+      .setCustomId(
+        'room_rename_modal'
+      )
+      .setTitle(
+        'Đổi tên phòng'
+      );
+
+  const input =
+    new TextInputBuilder()
+      .setCustomId(
+        'room_name'
+      )
+      .setLabel(
+        'Tên phòng mới'
+      )
+      .setPlaceholder(
+        'Ví dụ: Gaming'
+      )
+      .setStyle(
+        TextInputStyle.Short
+      )
+      .setMinLength(
+        1
+      )
+      .setMaxLength(
+        80
+      )
+      .setRequired(
+        true
+      )
+      .setValue(
+        cleanRoomName(
+          context.channel.name
+        )
+      );
+
+  modal.addComponents(
+    new ActionRowBuilder()
+      .addComponents(
+        input
+      )
+  );
+
   await interaction.showModal(
-    buildRenameModal(
-      context.channel
-    )
+    modal
   );
 }
 
 async function handleRenameModal(
   interaction
 ) {
+  await safeDeferReply(
+    interaction,
+    true
+  );
+
   const context =
     await getOwnerRoomContext(
       interaction
     );
 
-  if (!context) {
+  if (!context.ok) {
+    await tempReply(
+      interaction,
+      `❌ ${context.message}`,
+      {
+        error: true
+      }
+    );
+
     return;
   }
 
-  await interaction.deferReply({
-    ephemeral: true
-  });
-
-  const rawName =
-    interaction.fields
-      .getTextInputValue(
-        'vc_rename_value'
-      );
-
-  const name =
-    cleanRoomName(
-      rawName
+  const cooldown =
+    useCooldown(
+      interaction.user.id,
+      `rename:${interaction.channelId}`,
+      5000
     );
 
-  if (
-    !name ||
-    name === 'Phòng riêng'
-  ) {
-    return tempReply(
+  if (cooldown) {
+    await tempReply(
       interaction,
-      '❌ Tên phòng không hợp lệ.',
+      '⏳ Vui lòng chờ một chút trước khi đổi tên tiếp.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const requestedName =
+    cleanRoomName(
+      interaction.fields.getTextInputValue(
+        'room_name'
+      )
+    );
+
+  const finalName =
+    `${ROOM_PREFIX}${requestedName}`
+      .slice(
+        0,
+        100
+      );
+
+  try {
+    await context.channel.setName(
+      finalName,
+      `${BOT_NAME}: chủ phòng đổi tên`
+    );
+
+    await refreshRoomPanelSafe(
+      context.channel.id
+    );
+
+    await sendActionLog(
+      interaction.guild,
+      '✏️',
+      interaction.member,
+      `Đổi tên phòng thành ${finalName}`
+    );
+
+    await tempReply(
+      interaction,
+      `✅ Đã đổi tên phòng thành **${finalName}**.`
+    );
+  } catch (error) {
+    logError(
+      'ROOM_RENAME',
+      error
+    );
+
+    await tempReply(
+      interaction,
+      '❌ Không thể đổi tên phòng lúc này.',
       {
         error: true
       }
     );
   }
-
-  const newName =
-    `${ROOM_PREFIX}${name}`;
-
-  if (
-    context.channel.name !==
-    newName
-  ) {
-    await context.channel.setName(
-      newName,
-      `Đổi tên bởi ${interaction.user.username}`
-    );
-  }
-
-  await refreshRoomPanelSafe(
-    context.channel.id
-  );
-
-  await tempReply(
-    interaction,
-    `✏️ Đã đổi tên phòng thành **${name}**.`
-  );
 }
 
 async function handleLimitButton(
@@ -4032,396 +5418,527 @@ async function handleLimitButton(
       interaction
     );
 
-  if (!context) {
+  if (!context.ok) {
+    await tempReply(
+      interaction,
+      `❌ ${context.message}`,
+      {
+        error: true
+      }
+    );
+
     return;
   }
 
+  const modal =
+    new ModalBuilder()
+      .setCustomId(
+        'room_limit_modal'
+      )
+      .setTitle(
+        'Giới hạn thành viên'
+      );
+
+  const input =
+    new TextInputBuilder()
+      .setCustomId(
+        'room_limit_value'
+      )
+      .setLabel(
+        'Số người tối đa (0 = không giới hạn)'
+      )
+      .setPlaceholder(
+        'Ví dụ: 5'
+      )
+      .setStyle(
+        TextInputStyle.Short
+      )
+      .setMinLength(
+        1
+      )
+      .setMaxLength(
+        2
+      )
+      .setRequired(
+        true
+      )
+      .setValue(
+        String(
+          context.channel.userLimit ||
+          0
+        )
+      );
+
+  modal.addComponents(
+    new ActionRowBuilder()
+      .addComponents(
+        input
+      )
+  );
+
   await interaction.showModal(
-    buildLimitModal(
-      context.channel
-    )
+    modal
   );
 }
 
 async function handleLimitModal(
   interaction
 ) {
+  await safeDeferReply(
+    interaction,
+    true
+  );
+
   const context =
     await getOwnerRoomContext(
       interaction
     );
 
-  if (!context) {
-    return;
-  }
-
-  await interaction.deferReply({
-    ephemeral: true
-  });
-
-  const raw =
-    interaction.fields
-      .getTextInputValue(
-        'vc_limit_value'
-      )
-      .trim();
-
-  if (
-    !/^\d{1,2}$/.test(raw)
-  ) {
-    return tempReply(
+  if (!context.ok) {
+    await tempReply(
       interaction,
-      '❌ Hãy nhập số từ 0 đến 99.',
+      `❌ ${context.message}`,
       {
         error: true
       }
     );
+
+    return;
+  }
+
+  const raw =
+    interaction.fields
+      .getTextInputValue(
+        'room_limit_value'
+      )
+      .trim();
+
+  if (
+    !/^\d{1,2}$/.test(
+      raw
+    )
+  ) {
+    await tempReply(
+      interaction,
+      '❌ Giới hạn phải là số từ **0 đến 99**.',
+      {
+        error: true
+      }
+    );
+
+    return;
   }
 
   const limit =
     Number(raw);
 
   if (
-    !Number.isInteger(limit) ||
+    !Number.isInteger(
+      limit
+    ) ||
     limit < 0 ||
     limit > 99
   ) {
-    return tempReply(
+    await tempReply(
       interaction,
-      '❌ Giới hạn phải từ 0 đến 99.',
+      '❌ Giới hạn phải nằm trong khoảng **0 đến 99**.',
       {
         error: true
       }
     );
+
+    return;
   }
 
-  await context.channel
-    .setUserLimit(
+  try {
+    await context.channel.setUserLimit(
       limit,
-      `Thay đổi bởi ${interaction.user.username}`
+      `${BOT_NAME}: chủ phòng đổi giới hạn`
     );
 
-  await refreshRoomPanelSafe(
-    context.channel.id
-  );
-
-  await tempReply(
-    interaction,
-    limit === 0
-      ? '👥 Đã bỏ giới hạn thành viên.'
-      : `👥 Giới hạn phòng: **${limit} người**.`
-  );
-}
-
-async function handleInviteButton(
-  interaction
-) {
-  const context =
-    await getOwnerRoomContext(
-      interaction
+    await refreshRoomPanelSafe(
+      context.channel.id
     );
 
-  if (!context) {
-    return;
-  }
+    await sendActionLog(
+      interaction.guild,
+      '👥',
+      interaction.member,
+      limit === 0
+        ? `Bỏ giới hạn phòng ${context.channel.name}`
+        : `Giới hạn phòng ${context.channel.name}: ${limit} người`
+    );
 
-  if (
-    !useCooldown(
-      interaction.user.id,
-      'invite'
-    )
-  ) {
-    return tempReply(
+    await tempReply(
       interaction,
-      '⏳ Thao tác quá nhanh.',
+      limit === 0
+        ? '👥 Đã bỏ giới hạn thành viên.'
+        : `👥 Đã đặt giới hạn **${limit} người**.`
+    );
+  } catch (error) {
+    logError(
+      'ROOM_LIMIT',
+      error
+    );
+
+    await tempReply(
+      interaction,
+      '❌ Không thể thay đổi giới hạn phòng.',
       {
         error: true
       }
     );
   }
-
-  const target =
-    await resolveSelectedMember(
-      interaction,
-      context.room,
-      context.channel
-    );
-
-  if (!target) {
-    return;
-  }
-
-  await interaction.deferUpdate();
-
-  await inviteMember(
-    context.channel,
-    target
-  );
-
-  clearSelectedMember(
-    context.channel.id
-  );
-
-  await refreshRoomPanelSafe(
-    context.channel.id
-  );
-
-  await tempFollowUp(
-    interaction,
-    `✉️ Đã mời **${safeMemberName(target)}** vào phòng.`
-  );
 }
 
-async function handleDenyButton(
+async function handleInviteMember(
   interaction
 ) {
+  await safeDeferUpdate(
+    interaction
+  );
+
   const context =
     await getOwnerRoomContext(
       interaction
     );
 
-  if (!context) {
-    return;
-  }
-
-  if (
-    !useCooldown(
-      interaction.user.id,
-      'deny'
-    )
-  ) {
-    return tempReply(
+  if (!context.ok) {
+    await tempFollowUp(
       interaction,
-      '⏳ Thao tác quá nhanh.',
+      `❌ ${context.message}`,
       {
         error: true
       }
     );
-  }
 
-  const target =
-    await resolveSelectedMember(
-      interaction,
-      context.room,
-      context.channel
-    );
-
-  if (!target) {
     return;
   }
 
-  await interaction.deferUpdate();
-
-  await denyMember(
-    context.channel,
-    target
-  );
-
-  clearSelectedMember(
-    context.channel.id
-  );
-
-  await refreshRoomPanelSafe(
-    context.channel.id
-  );
-
-  await tempFollowUp(
-    interaction,
-    `⛔ Đã cấm **${safeMemberName(target)}** khỏi phòng.`
-  );
-}
-
-async function handleKickButton(
-  interaction
-) {
-  const context =
-    await getOwnerRoomContext(
-      interaction
+  const member =
+    await getRequiredSelectedMember(
+      interaction,
+      context
     );
 
-  if (!context) {
+  if (!member) {
     return;
   }
 
-  if (
-    !useCooldown(
-      interaction.user.id,
-      'kick'
-    )
-  ) {
-    return tempReply(
-      interaction,
-      '⏳ Thao tác quá nhanh.',
-      {
-        error: true
-      }
-    );
-  }
-
-  const target =
-    await resolveSelectedMember(
-      interaction,
-      context.room,
+  try {
+    await inviteMember(
       context.channel,
+      member
+    );
+
+    clearSelectedMember(
+      interaction.guild.id,
+      interaction.channelId,
+      interaction.user.id
+    );
+
+    await sendActionLog(
+      interaction.guild,
+      '✉️',
+      interaction.member,
+      `Mời ${safeMemberName(member)} vào phòng ${context.channel.name}`
+    );
+
+    await tempFollowUp(
+      interaction,
+      `✉️ Đã cấp quyền vào phòng cho **${safeMemberName(member)}**.`
+    );
+  } catch (error) {
+    logError(
+      'ROOM_INVITE',
+      error
+    );
+
+    await tempFollowUp(
+      interaction,
+      '❌ Không thể mời thành viên vào phòng.',
       {
-        mustBeInRoom: true
+        error: true
+      }
+    );
+  }
+}
+
+async function handleDenyMember(
+  interaction
+) {
+  await safeDeferUpdate(
+    interaction
+  );
+
+  const context =
+    await getOwnerRoomContext(
+      interaction
+    );
+
+  if (!context.ok) {
+    await tempFollowUp(
+      interaction,
+      `❌ ${context.message}`,
+      {
+        error: true
       }
     );
 
-  if (!target) {
     return;
   }
 
-  await interaction.deferUpdate();
+  const member =
+    await getRequiredSelectedMember(
+      interaction,
+      context
+    );
 
-  await kickMember(
-    context.channel,
-    target
-  );
+  if (!member) {
+    return;
+  }
 
-  clearSelectedMember(
-    context.channel.id
-  );
+  try {
+    await denyMember(
+      context.channel,
+      member
+    );
 
-  await refreshRoomPanelSafe(
-    context.channel.id
-  );
+    clearSelectedMember(
+      interaction.guild.id,
+      interaction.channelId,
+      interaction.user.id
+    );
 
-  await tempFollowUp(
-    interaction,
-    `👢 Đã đuổi **${safeMemberName(target)}** khỏi phòng.`
-  );
+    await sendActionLog(
+      interaction.guild,
+      '⛔',
+      interaction.member,
+      `Cấm ${safeMemberName(member)} khỏi phòng ${context.channel.name}`
+    );
+
+    await tempFollowUp(
+      interaction,
+      `⛔ Đã cấm **${safeMemberName(member)}** khỏi phòng.`
+    );
+  } catch (error) {
+    logError(
+      'ROOM_DENY',
+      error
+    );
+
+    await tempFollowUp(
+      interaction,
+      '❌ Không thể cấm thành viên khỏi phòng.',
+      {
+        error: true
+      }
+    );
+  }
 }
 
-async function handleResetButton(
+async function handleKickMember(
   interaction
 ) {
+  await safeDeferUpdate(
+    interaction
+  );
+
   const context =
     await getOwnerRoomContext(
       interaction
     );
 
-  if (!context) {
-    return;
-  }
-
-  await interaction.reply({
-    ...buildResetConfirmation(),
-    ephemeral: true
-  });
-}
-
-async function handleResetCancel(
-  interaction
-) {
-  await interaction.update({
-    content:
-      '✖️ Đã hủy đặt lại phòng.',
-    embeds: [],
-    components: []
-  });
-
-  deleteReplyLater(
-    interaction,
-    SUCCESS_DELETE_MS
-  );
-}
-
-async function handleResetConfirm(
-  interaction
-) {
-  const context =
-    await getOwnerRoomContext(
-      interaction
+  if (!context.ok) {
+    await tempFollowUp(
+      interaction,
+      `❌ ${context.message}`,
+      {
+        error: true
+      }
     );
 
-  if (!context) {
     return;
   }
 
-  await interaction.deferUpdate();
+  const member =
+    await getRequiredSelectedMember(
+      interaction,
+      context
+    );
 
-  await resetRoom(
-    context.channel,
-    context.room.owner_id
-  );
+  if (!member) {
+    return;
+  }
 
-  await refreshRoomPanelSafe(
+  if (
+    member.voice?.channelId !==
     context.channel.id
-  );
+  ) {
+    await tempFollowUp(
+      interaction,
+      '❌ Thành viên được chọn không còn ở trong phòng này.',
+      {
+        error: true
+      }
+    );
 
-  await interaction.editReply({
-    content:
-      '♻️ Phòng đã được đặt lại.',
-    embeds: [],
-    components: []
-  });
+    return;
+  }
 
-  deleteReplyLater(
-    interaction,
-    SUCCESS_DELETE_MS
-  );
+  try {
+    await kickMember(
+      context.channel,
+      member
+    );
+
+    clearSelectedMember(
+      interaction.guild.id,
+      interaction.channelId,
+      interaction.user.id
+    );
+
+    await sendActionLog(
+      interaction.guild,
+      '👢',
+      interaction.member,
+      `Đuổi ${safeMemberName(member)} khỏi phòng ${context.channel.name}`
+    );
+
+    await tempFollowUp(
+      interaction,
+      `👢 Đã đuổi **${safeMemberName(member)}** khỏi phòng.`
+    );
+  } catch (error) {
+    logError(
+      'ROOM_KICK',
+      error
+    );
+
+    await tempFollowUp(
+      interaction,
+      `❌ ${String(
+        error?.message ||
+        'Không thể đuổi thành viên.'
+      ).slice(0, 1000)}`,
+      {
+        error: true
+      }
+    );
+  }
 }
 
 async function handleRegionSelect(
   interaction
 ) {
+  await safeDeferUpdate(
+    interaction
+  );
+
   const context =
     await getOwnerRoomContext(
       interaction
     );
 
-  if (!context) {
+  if (!context.ok) {
+    await tempFollowUp(
+      interaction,
+      `❌ ${context.message}`,
+      {
+        error: true
+      }
+    );
+
     return;
   }
 
-  if (
-    !useCooldown(
+  const cooldown =
+    useCooldown(
       interaction.user.id,
-      'region'
-    )
-  ) {
-    return tempReply(
+      `region:${interaction.channelId}`,
+      3000
+    );
+
+  if (cooldown) {
+    await tempFollowUp(
       interaction,
-      '⏳ Thao tác quá nhanh.',
+      '⏳ Vui lòng chờ một chút trước khi đổi khu vực tiếp.',
       {
         error: true
       }
     );
+
+    return;
   }
 
-  const selected =
+  const requested =
     interaction.values?.[0];
 
-  if (!selected) {
-    return tempReply(
-      interaction,
-      '❌ Khu vực không hợp lệ.',
-      {
-        error: true
-      }
-    );
-  }
+  try {
+    let regionId = null;
+    let regionName =
+      'Tự động';
 
-  await interaction.deferUpdate();
+    if (
+      requested &&
+      requested !==
+        'automatic'
+    ) {
+      const region =
+        await validateRegion(
+          requested
+        );
 
-  if (
-    selected === 'automatic'
-  ) {
-    await context.channel
-      .setRTCRegion(null);
+      if (!region) {
+        await tempFollowUp(
+          interaction,
+          '❌ Khu vực này không còn khả dụng trên Discord.',
+          {
+            error: true
+          }
+        );
 
-    const fresh =
-      await interaction.guild.channels
-        .fetch(
+        await refreshRoomPanelSafe(
           context.channel.id
         );
 
+        return;
+      }
+
+      regionId =
+        region.id;
+
+      regionName =
+        region.name;
+    }
+
+    await context.channel.setRTCRegion(
+      regionId,
+      `${BOT_NAME}: chủ phòng đổi khu vực`
+    );
+
+    let verifiedChannel =
+      await interaction.guild.channels.fetch(
+        context.channel.id
+      ).catch(
+        () => null
+      );
+
+    if (!verifiedChannel) {
+      verifiedChannel =
+        context.channel;
+    }
+
+    const actual =
+      verifiedChannel.rtcRegion ||
+      null;
+
     if (
-      fresh.rtcRegion !== null
+      actual !==
+      regionId
     ) {
       throw new Error(
-        'Discord chưa xác nhận khu vực tự động.'
+        'Discord chưa xác nhận khu vực vừa chọn.'
       );
     }
 
@@ -4429,63 +5946,1132 @@ async function handleRegionSelect(
       context.channel.id
     );
 
-    return tempFollowUp(
+    await sendActionLog(
+      interaction.guild,
+      '🌐',
+      interaction.member,
+      `Đổi khu vực phòng ${context.channel.name}: ${regionName}`
+    );
+
+    await tempFollowUp(
       interaction,
-      '🌐 Khu vực: **Tự động**.'
+      `🌐 Đã đổi khu vực thành **${regionName}**.`
+    );
+  } catch (error) {
+    logError(
+      'ROOM_REGION',
+      error
+    );
+
+    await refreshRoomPanelSafe(
+      context.channel.id
+    );
+
+    await tempFollowUp(
+      interaction,
+      '❌ Không thể đổi khu vực Voice lúc này.',
+      {
+        error: true
+      }
     );
   }
+}
 
-  const regions =
-    await getVoiceRegions(
-      true
-    );
-
-  const region =
-    regions.find(
-      item =>
-        item.id === selected
-    );
-
-  if (!region) {
-    throw new Error(
-      'Khu vực thoại không còn khả dụng.'
-    );
-  }
-
-  await context.channel
-    .setRTCRegion(
-      region.id
-    );
-
-  const fresh =
-    await interaction.guild.channels
-      .fetch(
-        context.channel.id
+function buildResetConfirmPanel() {
+  const embed =
+    new EmbedBuilder()
+      .setTitle(
+        '♻️ ĐẶT LẠI PHÒNG'
+      )
+      .setDescription(
+        [
+          'Phòng sẽ được đưa về trạng thái mặc định:',
+          '',
+          '🔓 Mở phòng',
+          '👁️ Hiển thị công khai',
+          '👥 Không giới hạn thành viên',
+          '🌐 Khu vực tự động',
+          '🧹 Xóa quyền Mời/Cấm riêng của thành viên',
+          '',
+          '**Chủ phòng và phòng hiện tại vẫn được giữ nguyên.**'
+        ].join(
+          '\n'
+        )
       );
 
-  if (
-    fresh.rtcRegion !==
-    region.id
-  ) {
-    throw new Error(
-      'Discord chưa xác nhận thay đổi khu vực.'
-    );
-  }
+  const row =
+    new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId(
+            'room_reset_confirm'
+          )
+          .setLabel(
+            'Đặt lại'
+          )
+          .setEmoji(
+            '♻️'
+          )
+          .setStyle(
+            ButtonStyle.Danger
+          ),
+        new ButtonBuilder()
+          .setCustomId(
+            'room_reset_cancel'
+          )
+          .setLabel(
+            'Hủy'
+          )
+          .setEmoji(
+            '✖️'
+          )
+          .setStyle(
+            ButtonStyle.Secondary
+          )
+      );
 
-  await refreshRoomPanelSafe(
-    context.channel.id
+  return {
+    embeds: [
+      embed
+    ],
+    components: [
+      row
+    ]
+  };
+}
+
+async function handleResetButton(
+  interaction
+) {
+  await safeDeferReply(
+    interaction,
+    true
   );
 
-  await tempFollowUp(
-    interaction,
-    `🌐 Khu vực: **${safeDisplayName(region.name || region.id, 40)}**.`
+  const context =
+    await getOwnerRoomContext(
+      interaction
+    );
+
+  if (!context.ok) {
+    await tempReply(
+      interaction,
+      `❌ ${context.message}`,
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  await interaction.editReply(
+    buildResetConfirmPanel()
   );
 }
 
-async function transferRoomOwner(
+async function handleResetConfirm(
+  interaction
+) {
+  await safeDeferUpdate(
+    interaction
+  );
+
+  const context =
+    await getOwnerRoomContext(
+      interaction
+    );
+
+  if (!context.ok) {
+    await tempFollowUp(
+      interaction,
+      `❌ ${context.message}`,
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const cooldown =
+    useCooldown(
+      interaction.user.id,
+      `reset:${interaction.channelId}`,
+      5000
+    );
+
+  if (cooldown) {
+    await tempFollowUp(
+      interaction,
+      '⏳ Vui lòng chờ trước khi đặt lại phòng lần nữa.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  try {
+    await resetRoom(
+      context.channel,
+      String(
+        context.room.owner_id
+      )
+    );
+
+    clearSelectedMember(
+      interaction.guild.id,
+      interaction.channelId,
+      interaction.user.id
+    );
+
+    await refreshRoomPanelSafe(
+      context.channel.id
+    );
+
+    await sendActionLog(
+      interaction.guild,
+      '♻️',
+      interaction.member,
+      `Đặt lại phòng ${context.channel.name}`
+    );
+
+    try {
+      await interaction.editReply({
+        content:
+          '♻️ Đã đặt lại phòng về trạng thái mặc định.',
+        embeds: [],
+        components: []
+      });
+    } catch (error) {
+      logError(
+        'RESET_CONFIRM_REPLY',
+        error
+      );
+    }
+
+    deleteReplyLater(
+      interaction,
+      SUCCESS_DELETE_MS
+    );
+  } catch (error) {
+    logError(
+      'ROOM_RESET',
+      error
+    );
+
+    try {
+      await interaction.editReply({
+        content:
+          '❌ Không thể đặt lại phòng lúc này.',
+        embeds: [],
+        components: []
+      });
+
+      deleteReplyLater(
+        interaction,
+        ERROR_DELETE_MS
+      );
+    } catch {
+    }
+  }
+}
+
+async function handleResetCancel(
+  interaction
+) {
+  await safeDeferUpdate(
+    interaction
+  );
+
+  try {
+    await interaction.editReply({
+      content:
+        '✖️ Đã hủy đặt lại phòng.',
+      embeds: [],
+      components: []
+    });
+  } catch (error) {
+    logError(
+      'RESET_CANCEL',
+      error
+    );
+  }
+
+  deleteReplyLater(
+    interaction,
+    SUCCESS_DELETE_MS
+  );
+}
+async function sendActionLog(
+  guild,
+  emoji,
+  actor,
+  action
+) {
+  try {
+    if (!guild) {
+      return false;
+    }
+
+    const generator =
+      await getGenerator(
+        guild.id
+      );
+
+    if (
+      !generator?.action_log_channel_id
+    ) {
+      return false;
+    }
+
+    let channel =
+      guild.channels.cache.get(
+        String(
+          generator.action_log_channel_id
+        )
+      );
+
+    if (!channel) {
+      channel =
+        await guild.channels.fetch(
+          String(
+            generator.action_log_channel_id
+          )
+        ).catch(
+          () => null
+        );
+    }
+
+    if (
+      !channel ||
+      !channel.isTextBased()
+    ) {
+      return false;
+    }
+
+    let actorName =
+      BOT_NAME;
+
+    if (actor) {
+      if (
+        typeof actor === 'string'
+      ) {
+        actorName =
+          cleanDisplayName(
+            actor
+          ) ||
+          BOT_NAME;
+      } else {
+        actorName =
+          safeMemberName(
+            actor
+          );
+      }
+    }
+
+    const cleanAction =
+      String(
+        action || ''
+      )
+        .replace(
+          /[\r\n]+/g,
+          ' '
+        )
+        .trim()
+        .slice(
+          0,
+          1600
+        );
+
+    await channel.send({
+      content:
+        `${emoji} ${actorName} » ${cleanAction} • ${vietnamTime()}`
+    });
+
+    return true;
+  } catch (error) {
+    logError(
+      'ACTION_LOG',
+      error
+    );
+
+    return false;
+  }
+}
+
+function transferMessageComponents(
+  channelId,
+  ownerId,
+  targetId
+) {
+  return [
+    new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId(
+            `transfer_accept:${channelId}:${ownerId}:${targetId}`
+          )
+          .setLabel(
+            'Đồng ý'
+          )
+          .setEmoji(
+            '👑'
+          )
+          .setStyle(
+            ButtonStyle.Success
+          ),
+        new ButtonBuilder()
+          .setCustomId(
+            `transfer_decline:${channelId}:${ownerId}:${targetId}`
+          )
+          .setLabel(
+            'Từ chối'
+          )
+          .setEmoji(
+            '✖️'
+          )
+          .setStyle(
+            ButtonStyle.Secondary
+          )
+      )
+  ];
+}
+
+async function finishTransferMessage(
+  transfer,
+  content
+) {
+  if (
+    !transfer?.message
+  ) {
+    return;
+  }
+
+  try {
+    await transfer.message.edit({
+      content,
+      embeds: [],
+      components: []
+    });
+
+    deleteMessageLater(
+      transfer.message,
+      SUCCESS_DELETE_MS
+    );
+  } catch (error) {
+    logError(
+      'TRANSFER_FINISH_MESSAGE',
+      error
+    );
+  }
+}
+
+async function expireTransfer(
+  channelId
+) {
+  const transfer =
+    pendingTransfers.get(
+      transferKey(
+        channelId
+      )
+    );
+
+  if (!transfer) {
+    return;
+  }
+
+  if (
+    transfer.expiresAt >
+    Date.now()
+  ) {
+    return;
+  }
+
+  pendingTransfers.delete(
+    transferKey(
+      channelId
+    )
+  );
+
+  let targetName =
+    transfer.targetName ||
+    'Thành viên';
+
+  try {
+    const guild =
+      client.guilds.cache.get(
+        transfer.guildId
+      );
+
+    const target =
+      guild
+        ? await getGuildMember(
+            guild,
+            transfer.targetId
+          )
+        : null;
+
+    if (target) {
+      targetName =
+        safeMemberName(
+          target
+        );
+    }
+  } catch {
+  }
+
+  await finishTransferMessage(
+    transfer,
+    `⌛ ${targetName} đã từ chối do không phản hồi trong 60 giây.`
+  );
+}
+
+async function handleTransferButton(
+  interaction
+) {
+  await safeDeferUpdate(
+    interaction
+  );
+
+  const context =
+    await getOwnerRoomContext(
+      interaction
+    );
+
+  if (!context.ok) {
+    await tempFollowUp(
+      interaction,
+      `❌ ${context.message}`,
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const existingTransfer =
+    getPendingTransfer(
+      context.channel.id
+    );
+
+  if (existingTransfer) {
+    await tempFollowUp(
+      interaction,
+      '⏳ Phòng đang có một yêu cầu chuyển chủ chờ phản hồi.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const target =
+    await getRequiredSelectedMember(
+      interaction,
+      context
+    );
+
+  if (!target) {
+    return;
+  }
+
+  if (
+    target.voice?.channelId !==
+    context.channel.id
+  ) {
+    await tempFollowUp(
+      interaction,
+      '❌ Người nhận quyền chủ phải đang ở trong phòng này.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const expiresAt =
+    Date.now() +
+    TRANSFER_TIMEOUT_MS;
+
+  try {
+    const owner =
+      await getGuildMember(
+        interaction.guild,
+        interaction.user.id
+      );
+
+    const ownerName =
+      owner
+        ? safeMemberName(
+            owner
+          )
+        : cleanDisplayName(
+            interaction.user.globalName ||
+            interaction.user.username
+          );
+
+    const targetName =
+      safeMemberName(
+        target
+      );
+
+    const message =
+      await context.channel.send({
+        content:
+          `👑 ${ownerName} muốn chuyển quyền chủ phòng cho <@${target.id}>\n` +
+          `⏳ Hết hạn ${relativeTimestamp(expiresAt)}`,
+        components:
+          transferMessageComponents(
+            context.channel.id,
+            interaction.user.id,
+            target.id
+          ),
+        allowedMentions: {
+          users: [
+            target.id
+          ]
+        }
+      });
+
+    const transfer = {
+      guildId:
+        interaction.guild.id,
+      channelId:
+        context.channel.id,
+      ownerId:
+        interaction.user.id,
+      targetId:
+        target.id,
+      targetName,
+      expiresAt,
+      message,
+      timer:
+        null
+    };
+
+    const timer =
+      setTimeout(
+        () => {
+          expireTransfer(
+            context.channel.id
+          ).catch(
+            error => {
+              logError(
+                'TRANSFER_TIMEOUT',
+                error
+              );
+            }
+          );
+        },
+        TRANSFER_TIMEOUT_MS +
+        250
+      );
+
+    timer.unref?.();
+
+    transfer.timer =
+      timer;
+
+    pendingTransfers.set(
+      transferKey(
+        context.channel.id
+      ),
+      transfer
+    );
+
+    clearSelectedMember(
+      interaction.guild.id,
+      interaction.channelId,
+      interaction.user.id
+    );
+
+    await sendActionLog(
+      interaction.guild,
+      '👑',
+      interaction.member,
+      `Gửi yêu cầu chuyển chủ phòng ${context.channel.name} cho ${targetName}`
+    );
+  } catch (error) {
+    logError(
+      'TRANSFER_REQUEST',
+      error
+    );
+
+    await tempFollowUp(
+      interaction,
+      '❌ Không thể gửi yêu cầu chuyển chủ.',
+      {
+        error: true
+      }
+    );
+  }
+}
+
+function parseTransferCustomId(
+  customId
+) {
+  const parts =
+    String(
+      customId || ''
+    ).split(
+      ':'
+    );
+
+  if (
+    parts.length !== 4
+  ) {
+    return null;
+  }
+
+  const [
+    action,
+    channelId,
+    ownerId,
+    targetId
+  ] = parts;
+
+  if (
+    action !==
+      'transfer_accept' &&
+    action !==
+      'transfer_decline'
+  ) {
+    return null;
+  }
+
+  if (
+    !isSnowflake(
+      channelId
+    ) ||
+    !isSnowflake(
+      ownerId
+    ) ||
+    !isSnowflake(
+      targetId
+    )
+  ) {
+    return null;
+  }
+
+  return {
+    action,
+    channelId,
+    ownerId,
+    targetId
+  };
+}
+
+async function handleTransferDecision(
+  interaction
+) {
+  await safeDeferUpdate(
+    interaction
+  );
+
+  const parsed =
+    parseTransferCustomId(
+      interaction.customId
+    );
+
+  if (
+    !parsed ||
+    !interaction.guild
+  ) {
+    await tempFollowUp(
+      interaction,
+      '❌ Yêu cầu chuyển chủ không hợp lệ.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const transfer =
+    getPendingTransfer(
+      parsed.channelId
+    );
+
+  if (
+    !transfer ||
+    transfer.ownerId !==
+      parsed.ownerId ||
+    transfer.targetId !==
+      parsed.targetId
+  ) {
+    await tempFollowUp(
+      interaction,
+      '⌛ Yêu cầu chuyển chủ này đã hết hạn hoặc không còn hiệu lực.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  if (
+    interaction.user.id !==
+    transfer.targetId
+  ) {
+    await tempFollowUp(
+      interaction,
+      '❌ Chỉ thành viên được mời nhận quyền chủ mới có thể phản hồi.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  if (
+    parsed.action ===
+    'transfer_decline'
+  ) {
+    clearPendingTransfer(
+      parsed.channelId
+    );
+
+    const target =
+      await getGuildMember(
+        interaction.guild,
+        transfer.targetId
+      );
+
+    const targetName =
+      target
+        ? safeMemberName(
+            target
+          )
+        : transfer.targetName;
+
+    await finishTransferMessage(
+      transfer,
+      `✖️ ${targetName} đã từ chối nhận quyền chủ phòng.`
+    );
+
+    await sendActionLog(
+      interaction.guild,
+      '✖️',
+      target ||
+      targetName,
+      'Từ chối yêu cầu nhận quyền chủ phòng'
+    );
+
+    return;
+  }
+
+  const room =
+    await getRoom(
+      parsed.channelId
+    );
+
+  if (!room) {
+    clearPendingTransfer(
+      parsed.channelId
+    );
+
+    await finishTransferMessage(
+      transfer,
+      '❌ Phòng không còn tồn tại.'
+    );
+
+    return;
+  }
+
+  if (
+    String(
+      room.owner_id
+    ) !==
+    transfer.ownerId
+  ) {
+    clearPendingTransfer(
+      parsed.channelId
+    );
+
+    await finishTransferMessage(
+      transfer,
+      '❌ Chủ phòng đã thay đổi. Yêu cầu chuyển chủ cũ không còn hiệu lực.'
+    );
+
+    return;
+  }
+
+  let channel =
+    interaction.guild.channels.cache.get(
+      parsed.channelId
+    );
+
+  if (!channel) {
+    channel =
+      await interaction.guild.channels.fetch(
+        parsed.channelId
+      ).catch(
+        () => null
+      );
+  }
+
+  if (
+    !channel ||
+    channel.type !==
+      ChannelType.GuildVoice
+  ) {
+    clearPendingTransfer(
+      parsed.channelId
+    );
+
+    await finishTransferMessage(
+      transfer,
+      '❌ Phòng không còn tồn tại.'
+    );
+
+    return;
+  }
+
+  const target =
+    await getGuildMember(
+      interaction.guild,
+      transfer.targetId
+    );
+
+  if (
+    !target ||
+    target.voice?.channelId !==
+      channel.id
+  ) {
+    await tempFollowUp(
+      interaction,
+      '❌ Bạn phải còn ở trong phòng để nhận quyền chủ.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const oldOwner =
+    await getGuildMember(
+      interaction.guild,
+      transfer.ownerId
+    );
+
+  try {
+    const conflictingRoom =
+      await getOwnedRoom(
+        interaction.guild.id,
+        target.id
+      );
+
+    if (
+      conflictingRoom &&
+      String(
+        conflictingRoom.channel_id
+      ) !==
+      channel.id
+    ) {
+      let conflictChannel =
+        interaction.guild.channels.cache.get(
+          String(
+            conflictingRoom.channel_id
+          )
+        );
+
+      if (!conflictChannel) {
+        conflictChannel =
+          await interaction.guild.channels.fetch(
+            String(
+              conflictingRoom.channel_id
+            )
+          ).catch(
+            () => null
+          );
+      }
+
+      if (conflictChannel) {
+        await tempFollowUp(
+          interaction,
+          '❌ Bạn đang sở hữu một phòng Voice HDK khác nên chưa thể nhận phòng này.',
+          {
+            error: true
+          }
+        );
+
+        return;
+      }
+
+      await deleteRoomRecord(
+        String(
+          conflictingRoom.channel_id
+        )
+      );
+    }
+
+    await grantOwnerPermissions(
+      channel,
+      target.id
+    );
+
+    const dbClient =
+      await pool.connect();
+
+    try {
+      await dbClient.query(
+        'BEGIN'
+      );
+
+      const locked =
+        await dbClient.query(
+          `
+            SELECT owner_id
+            FROM rooms
+            WHERE channel_id = $1
+            FOR UPDATE
+          `,
+          [
+            channel.id
+          ]
+        );
+
+      if (
+        !locked.rows[0] ||
+        String(
+          locked.rows[0].owner_id
+        ) !==
+        transfer.ownerId
+      ) {
+        throw new Error(
+          'Chủ phòng đã thay đổi trước khi xác nhận.'
+        );
+      }
+
+      await dbClient.query(
+        `
+          UPDATE rooms
+          SET owner_id = $1
+          WHERE channel_id = $2
+        `,
+        [
+          target.id,
+          channel.id
+        ]
+      );
+
+      await dbClient.query(
+        'COMMIT'
+      );
+    } catch (error) {
+      await dbClient.query(
+        'ROLLBACK'
+      ).catch(
+        () => {}
+      );
+
+      throw error;
+    } finally {
+      dbClient.release();
+    }
+
+    const oldOwnerOverwrite =
+      channel.permissionOverwrites.cache.get(
+        transfer.ownerId
+      );
+
+    if (
+      oldOwnerOverwrite &&
+      oldOwnerOverwrite.type ===
+        PermissionOverwriteType.Member
+    ) {
+      await safeDeleteOverwrite(
+        channel,
+        transfer.ownerId,
+        `${BOT_NAME}: thu hồi quyền chủ phòng cũ`
+      );
+    }
+
+    clearPendingTransfer(
+      channel.id
+    );
+
+    clearSelectionsForChannel(
+      interaction.guild.id,
+      channel.id
+    );
+
+    await refreshRoomPanelSafe(
+      channel.id
+    );
+
+    const targetName =
+      safeMemberName(
+        target
+      );
+
+    await finishTransferMessage(
+      transfer,
+      `👑 ${targetName} đã trở thành chủ phòng mới.`
+    );
+
+    await sendActionLog(
+      interaction.guild,
+      '👑',
+      oldOwner ||
+      transfer.ownerId,
+      `Chuyển chủ phòng ${channel.name} cho ${targetName}`
+    );
+  } catch (error) {
+    logError(
+      'TRANSFER_ACCEPT',
+      error
+    );
+
+    const currentRoom =
+      await getRoom(
+        channel.id
+      ).catch(
+        () => null
+      );
+
+    if (
+      !currentRoom ||
+      String(
+        currentRoom.owner_id
+      ) !==
+      target.id
+    ) {
+      await safeDeleteOverwrite(
+        channel,
+        target.id,
+        `${BOT_NAME}: hoàn tác quyền chuyển chủ lỗi`
+      ).catch(
+        () => {}
+      );
+    }
+
+    await tempFollowUp(
+      interaction,
+      `❌ Không thể chuyển chủ: ${String(
+        error?.message ||
+        'Lỗi không xác định.'
+      ).slice(0, 1000)}`,
+      {
+        error: true
+      }
+    );
+  }
+}
+
+async function claimRoom(
   channel,
-  oldOwnerId,
-  newOwner
+  member
 ) {
   const room =
     await getRoom(
@@ -4494,613 +7080,291 @@ async function transferRoomOwner(
 
   if (!room) {
     throw new Error(
-      'Phòng không còn trong cơ sở dữ liệu.'
+      'Phòng không còn được Voice HDK quản lý.'
     );
   }
 
   if (
-    String(room.owner_id) !==
-    String(oldOwnerId)
+    String(
+      room.owner_id
+    ) ===
+    member.id
   ) {
     throw new Error(
-      'Chủ phòng đã thay đổi.'
+      'Bạn đã là chủ phòng.'
     );
   }
 
   if (
-    newOwner.voice.channelId !==
+    member.voice?.channelId !==
     channel.id
   ) {
     throw new Error(
-      'Người nhận không còn ở trong phòng.'
+      'Bạn phải đang ở trong phòng để nhận quyền chủ.'
+    );
+  }
+
+  const currentOwner =
+    await getGuildMember(
+      channel.guild,
+      String(
+        room.owner_id
+      )
+    );
+
+  if (
+    currentOwner?.voice?.channelId ===
+    channel.id
+  ) {
+    throw new Error(
+      'Chủ phòng hiện tại vẫn đang ở trong phòng.'
+    );
+  }
+
+  const owned =
+    await getOwnedRoom(
+      channel.guild.id,
+      member.id
+    );
+
+  if (
+    owned &&
+    String(
+      owned.channel_id
+    ) !==
+    channel.id
+  ) {
+    let ownedChannel =
+      channel.guild.channels.cache.get(
+        String(
+          owned.channel_id
+        )
+      );
+
+    if (!ownedChannel) {
+      ownedChannel =
+        await channel.guild.channels.fetch(
+          String(
+            owned.channel_id
+          )
+        ).catch(
+          () => null
+        );
+    }
+
+    if (ownedChannel) {
+      throw new Error(
+        'Bạn đang sở hữu một phòng Voice HDK khác.'
+      );
+    }
+
+    await deleteRoomRecord(
+      String(
+        owned.channel_id
+      )
     );
   }
 
   await grantOwnerPermissions(
     channel,
-    newOwner.id
+    member.id
   );
 
-  const updated =
-    await updateRoomOwner(
-      channel.id,
-      oldOwnerId,
-      newOwner.id
-    );
-
-  if (!updated) {
-    await channel.permissionOverwrites
-      .delete(newOwner.id)
-      .catch(() => {});
-
-    throw new Error(
-      'Không thể cập nhật chủ phòng trong cơ sở dữ liệu.'
-    );
-  }
+  const dbClient =
+    await pool.connect();
 
   try {
-    await removeOwnerPermissions(
-      channel,
-      oldOwnerId
+    await dbClient.query(
+      'BEGIN'
     );
+
+    const locked =
+      await dbClient.query(
+        `
+          SELECT owner_id
+          FROM rooms
+          WHERE channel_id = $1
+          FOR UPDATE
+        `,
+        [
+          channel.id
+        ]
+      );
+
+    if (!locked.rows[0]) {
+      throw new Error(
+        'Phòng không còn trong Database.'
+      );
+    }
+
+    const lockedOwnerId =
+      String(
+        locked.rows[0].owner_id
+      );
+
+    const lockedOwner =
+      await getGuildMember(
+        channel.guild,
+        lockedOwnerId
+      );
+
+    if (
+      lockedOwner?.voice?.channelId ===
+      channel.id
+    ) {
+      throw new Error(
+        'Chủ phòng đã quay lại phòng.'
+      );
+    }
+
+    await dbClient.query(
+      `
+        UPDATE rooms
+        SET owner_id = $1
+        WHERE channel_id = $2
+      `,
+      [
+        member.id,
+        channel.id
+      ]
+    );
+
+    await dbClient.query(
+      'COMMIT'
+    );
+
+    if (
+      lockedOwnerId !==
+      member.id
+    ) {
+      await safeDeleteOverwrite(
+        channel,
+        lockedOwnerId,
+        `${BOT_NAME}: thu hồi quyền chủ phòng cũ`
+      );
+    }
+
+    clearPendingTransfer(
+      channel.id
+    );
+
+    clearSelectionsForChannel(
+      channel.guild.id,
+      channel.id
+    );
+
+    await refreshRoomPanelSafe(
+      channel.id
+    );
+
+    return true;
   } catch (error) {
-    logError(
-      'TRANSFER_REMOVE_OLD_OWNER',
-      error,
-      {
-        channelId:
-          channel.id,
-
-        oldOwnerId,
-        newOwnerId:
-          newOwner.id
-      }
+    await dbClient.query(
+      'ROLLBACK'
+    ).catch(
+      () => {}
     );
+
+    const current =
+      await getRoom(
+        channel.id
+      ).catch(
+        () => null
+      );
+
+    if (
+      !current ||
+      String(
+        current.owner_id
+      ) !==
+      member.id
+    ) {
+      await safeDeleteOverwrite(
+        channel,
+        member.id,
+        `${BOT_NAME}: hoàn tác quyền claim lỗi`
+      ).catch(
+        () => {}
+      );
+    }
+
+    throw error;
+  } finally {
+    dbClient.release();
   }
-
-  clearSelectedMember(
-    channel.id
-  );
-
-  await refreshRoomPanelSafe(
-    channel.id
-  );
-
-  return updated;
 }
 
-async function expireTransferRequest(
-  channelId,
-  messageId
+async function sendChatLog(
+  guild,
+  payload
 ) {
-  const key =
-    String(channelId);
-
-  const pending =
-    pendingTransfers.get(key);
-
-  if (
-    !pending ||
-    String(pending.messageId) !==
-      String(messageId)
-  ) {
-    return;
-  }
-
-  pendingTransfers.delete(key);
-
-  const guild =
-    client.guilds.cache.get(
-      pending.guildId
-    );
-
-  const channel =
-    guild
-      ? await guild.channels
-          .fetch(channelId)
-          .catch(() => null)
-      : null;
-
-  if (
-    !channel ||
-    !channel.isTextBased()
-  ) {
-    return;
-  }
-
-  const message =
-    await channel.messages
-      .fetch(messageId)
-      .catch(() => null);
-
-  if (!message) {
-    return;
-  }
-
-  const target =
-    await guild.members
-      .fetch(
-        pending.newOwnerId
-      )
-      .catch(() => null);
-
-  const targetName =
-    target
-      ? safeMemberName(target)
-      : 'Thành viên';
-
   try {
-    await message.edit({
-      content:
-        `⌛ **${targetName}** đã từ chối do không phản hồi trong 60 giây.`,
-      embeds: [],
-      components: []
-    });
-
-    const timer =
-      setTimeout(
-        () => {
-          message
-            .delete()
-            .catch(() => {});
-        },
-        SUCCESS_DELETE_MS
+    const generator =
+      await getGenerator(
+        guild.id
       );
 
-    timer.unref?.();
-  } catch (error) {
-    logError(
-      'TRANSFER_EXPIRE',
-      error,
-      {
-        channelId,
-        messageId
-      }
-    );
-  }
-}
+    if (
+      !generator?.chat_log_channel_id
+    ) {
+      return null;
+    }
 
-async function handleTransferButton(
-  interaction
-) {
-  const context =
-    await getOwnerRoomContext(
-      interaction
-    );
-
-  if (!context) {
-    return;
-  }
-
-  if (
-    !useCooldown(
-      interaction.user.id,
-      'transfer'
-    )
-  ) {
-    return tempReply(
-      interaction,
-      '⏳ Thao tác quá nhanh.',
-      {
-        error: true
-      }
-    );
-  }
-
-  const target =
-    await resolveSelectedMember(
-      interaction,
-      context.room,
-      context.channel,
-      {
-        mustBeInRoom: true
-      }
-    );
-
-  if (!target) {
-    return;
-  }
-
-  await interaction.deferUpdate();
-
-  clearPendingTransfer(
-    context.channel.id
-  );
-
-  const expiresAt =
-    Date.now() +
-    TRANSFER_TIMEOUT_MS;
-
-  const acceptButton =
-    new ButtonBuilder()
-      .setCustomId(
-        `transfer_accept:${context.channel.id}`
-      )
-      .setLabel(
-        'Đồng ý'
-      )
-      .setEmoji('👑')
-      .setStyle(
-        ButtonStyle.Success
-      );
-
-  const declineButton =
-    new ButtonBuilder()
-      .setCustomId(
-        `transfer_decline:${context.channel.id}`
-      )
-      .setLabel(
-        'Từ chối'
-      )
-      .setEmoji('✖️')
-      .setStyle(
-        ButtonStyle.Secondary
-      );
-
-  const row =
-    new ActionRowBuilder()
-      .addComponents(
-        acceptButton,
-        declineButton
-      );
-
-  const request =
-    await context.channel.send({
-      content: [
-        `👑 <@${context.room.owner_id}> muốn chuyển quyền chủ phòng cho <@${target.id}>`,
-        `⏳ Hết hạn ${relativeTimestamp(expiresAt)}`
-      ].join('\n'),
-
-      components: [row]
-    });
-
-  const pending = {
-    guildId:
-      interaction.guild.id,
-
-    channelId:
-      context.channel.id,
-
-    oldOwnerId:
-      context.room.owner_id,
-
-    newOwnerId:
-      target.id,
-
-    messageId:
-      request.id,
-
-    expiresAt,
-
-    timer: null
-  };
-
-  pending.timer =
-    setTimeout(
-      () => {
-        expireTransferRequest(
-          context.channel.id,
-          request.id
-        ).catch(
-          error => {
-            logError(
-              'TRANSFER_TIMEOUT',
-              error,
-              {
-                channelId:
-                  context.channel.id,
-
-                messageId:
-                  request.id
-              }
-            );
-          }
-        );
-      },
-      TRANSFER_TIMEOUT_MS
-    );
-
-  pending.timer.unref?.();
-
-  pendingTransfers.set(
-    String(
-      context.channel.id
-    ),
-    pending
-  );
-
-  // Chọn thành viên chỉ dùng cho một hành động.
-  // Sau khi gửi yêu cầu chuyển chủ thì xóa lựa chọn.
-  clearSelectedMember(
-    context.channel.id
-  );
-
-  await refreshRoomPanelSafe(
-    context.channel.id
-  );
-}
-
-async function handleTransferResponse(
-  interaction,
-  action,
-  channelId
-) {
-  const pending =
-    pendingTransfers.get(
-      String(channelId)
-    );
-
-  if (!pending) {
-    return tempReply(
-      interaction,
-      '⌛ Yêu cầu chuyển chủ không còn hiệu lực.',
-      {
-        error: true
-      }
-    );
-  }
-
-  if (
-    String(interaction.message.id) !==
-    String(pending.messageId)
-  ) {
-    return tempReply(
-      interaction,
-      '⌛ Đây không còn là yêu cầu chuyển chủ hiện tại.',
-      {
-        error: true
-      }
-    );
-  }
-
-  if (
-    String(interaction.user.id) !==
-    String(pending.newOwnerId)
-  ) {
-    return tempReply(
-      interaction,
-      '⛔ Chỉ người được chọn mới có thể phản hồi.',
-      {
-        error: true
-      }
-    );
-  }
-
-  if (
-    Date.now() >=
-    pending.expiresAt
-  ) {
-    clearPendingTransfer(
-      channelId
-    );
-
-    await interaction.update({
-      content:
-        '⌛ Yêu cầu chuyển chủ đã hết hạn do không phản hồi trong 60 giây.',
-      components: []
-    });
-
-    const timer =
-      setTimeout(
-        () => {
-          interaction.message
-            .delete()
-            .catch(() => {});
-        },
-        SUCCESS_DELETE_MS
-      );
-
-    timer.unref?.();
-
-    return;
-  }
-
-  if (
-    action === 'decline'
-  ) {
-    clearPendingTransfer(
-      channelId
-    );
-
-    const target =
-      await interaction.guild.members
-        .fetch(
-          interaction.user.id
+    let channel =
+      guild.channels.cache.get(
+        String(
+          generator.chat_log_channel_id
         )
-        .catch(() => null);
-
-    await interaction.update({
-      content:
-        `✖️ **${target ? safeMemberName(target) : interaction.user.username}** đã từ chối nhận quyền chủ phòng.`,
-      components: []
-    });
-
-    const timer =
-      setTimeout(
-        () => {
-          interaction.message
-            .delete()
-            .catch(() => {});
-        },
-        SUCCESS_DELETE_MS
       );
 
-    timer.unref?.();
-
-    return;
-  }
-
-  const channel =
-    await interaction.guild.channels
-      .fetch(channelId)
-      .catch(() => null);
-
-  if (
-    !channel ||
-    channel.type !==
-      ChannelType.GuildVoice
-  ) {
-    clearPendingTransfer(
-      channelId
-    );
-
-    return tempReply(
-      interaction,
-      '❌ Phòng thoại không còn tồn tại.',
-      {
-        error: true
-      }
-    );
-  }
-
-  const currentRoom =
-    await getRoom(
-      channel.id
-    );
-
-  if (
-    !currentRoom ||
-    String(currentRoom.owner_id) !==
-      String(pending.oldOwnerId)
-  ) {
-    clearPendingTransfer(
-      channelId
-    );
-
-    return tempReply(
-      interaction,
-      '❌ Chủ phòng đã thay đổi. Yêu cầu này không còn hiệu lực.',
-      {
-        error: true
-      }
-    );
-  }
-
-  const newOwner =
-    await interaction.guild.members
-      .fetch(
-        pending.newOwnerId
-      )
-      .catch(() => null);
-
-  if (
-    !newOwner ||
-    newOwner.voice.channelId !==
-      channel.id
-  ) {
-    clearPendingTransfer(
-      channelId
-    );
-
-    await interaction.update({
-      content:
-        '❌ Không thể chuyển chủ vì người nhận không còn ở trong phòng.',
-      components: []
-    });
-
-    const timer =
-      setTimeout(
-        () => {
-          interaction.message
-            .delete()
-            .catch(() => {});
-        },
-        ERROR_DELETE_MS
-      );
-
-    timer.unref?.();
-
-    return;
-  }
-
-  await interaction.deferUpdate();
-
-  await transferRoomOwner(
-    channel,
-    pending.oldOwnerId,
-    newOwner
-  );
-
-  clearPendingTransfer(
-    channelId
-  );
-
-  await interaction.message.edit({
-    content:
-      `👑 **${safeMemberName(newOwner)}** đã trở thành chủ phòng.`,
-    components: []
-  });
-
-  const timer =
-    setTimeout(
-      () => {
-        interaction.message
-          .delete()
-          .catch(() => {});
-      },
-      SUCCESS_DELETE_MS
-    );
-
-  timer.unref?.();
-}
-function disableComponents(
-  message
-) {
-  return (
-    message.components?.map(
-      row =>
-        new ActionRowBuilder()
-          .addComponents(
-            row.components.map(
-              component =>
-                ButtonBuilder.from(
-                  component
-                ).setDisabled(true)
-            )
+    if (!channel) {
+      channel =
+        await guild.channels.fetch(
+          String(
+            generator.chat_log_channel_id
           )
-    ) || []
-  );
-}
+        ).catch(
+          () => null
+        );
+    }
 
-async function getLogChannel(
-  guild
-) {
-  const generator =
-    await getGenerator(
-      guild.id
+    if (
+      !channel ||
+      !channel.isTextBased()
+    ) {
+      return null;
+    }
+
+    return await channel.send(
+      payload
+    );
+  } catch (error) {
+    logError(
+      'CHAT_LOG_SEND',
+      error
     );
 
-  if (
-    !generator?.blog_channel_id
-  ) {
     return null;
   }
-
-  const channel =
-    await guild.channels
-      .fetch(
-        generator.blog_channel_id
-      )
-      .catch(() => null);
-
-  if (
-    !channel ||
-    !channel.isTextBased()
-  ) {
-    return null;
-  }
-
-  return channel;
 }
 
-function truncateText(
+function sanitizeLogText(
   value,
-  maxLength = 1500
+  maxLength = 1400
 ) {
   const text =
-    String(value || '')
-      .replace(/\r/g, '')
+    String(
+      value || ''
+    )
+      .replace(
+        /\u0000/g,
+        ''
+      )
       .trim();
+
+  if (!text) {
+    return '';
+  }
 
   if (
     text.length <=
@@ -5112,173 +7376,82 @@ function truncateText(
   return (
     text.slice(
       0,
-      Math.max(
-        1,
-        maxLength - 1
-      )
-    ) + '…'
+      maxLength - 1
+    ) +
+    '…'
   );
 }
 
 function quoteLogText(
   value
 ) {
-  const text =
-    truncateText(
-      value,
-      1400
+  return sanitizeLogText(
+    value
+  )
+    .replace(
+      /\\/g,
+      '\\\\'
     )
-      .replace(/\n+/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-  if (!text) {
-    return '';
-  }
-
-  return `"${text.replace(
-    /"/g,
-    '”'
-  )}"`;
+    .replace(
+      /"/g,
+      '\\"'
+    )
+    .replace(
+      /\r?\n/g,
+      ' ↵ '
+    );
 }
 
 function extractLinks(
   content
 ) {
   const matches =
-    String(content || '')
-      .match(
-        /https?:\/\/[^\s<]+/gi
-      ) || [];
+    String(
+      content || ''
+    ).match(
+      /https?:\/\/[^\s<>"']+/gi
+    ) || [];
 
   return [
     ...new Set(
-      matches.map(
-        link =>
-          link.replace(
-            /[),.;!?]+$/g,
-            ''
-          )
-      )
+      matches
     )
-  ];
-}
-
-function attachmentNames(
-  message
-) {
-  return [
-    ...message.attachments.values()
-  ].map(
-    attachment =>
-      safeDisplayName(
-        attachment.name ||
-        'tep-dinh-kem',
-        80
-      )
+  ].slice(
+    0,
+    10
   );
 }
 
-function buildMessageLogText(
-  message
-) {
-  const memberName =
-    safeMemberName(
-      message.member
-    );
-
-  const content =
-    quoteLogText(
-      message.content
-    );
-
-  const links =
-    extractLinks(
-      message.content
-    );
-
-  const files =
-    attachmentNames(
-      message
-    );
-
-  const time =
-    vietnamTime(
-      message.createdAt ||
-      new Date()
-    );
-
-  if (
-    !links.length &&
-    !files.length
-  ) {
-    return (
-      `${memberName} » ` +
-      `${content || '"(không có nội dung)"'} ` +
-      `• ${time}`
-    );
-  }
-
-  const lines = [];
-
-  if (content) {
-    lines.push(
-      `${memberName} » ${content}`
-    );
-  } else {
-    lines.push(
-      `${memberName} »`
-    );
-  }
-
-  if (links.length) {
-    lines.push(
-      `🔗 Liên kết: ${
-        links.join(' • ')
-      }`
-    );
-  }
-
-  if (files.length) {
-    lines.push(
-      `📎 Tệp đính kèm: ${
-        files.join(' • ')
-      }`
-    );
-  }
-
-  lines.push(time);
-
-  return lines.join('\n');
-}
-
-async function downloadAttachmentBuffer(
+function safeAttachmentName(
   attachment
 ) {
-  if (!attachment?.url) {
-    return null;
-  }
+  return sanitizeLogText(
+    attachment?.name ||
+    'tep-dinh-kem',
+    120
+  );
+}
 
+async function downloadAttachmentForLog(
+  attachment
+) {
   const maxBytes =
-    20 * 1024 * 1024;
+    8 * 1024 * 1024;
 
   if (
-    Number(attachment.size || 0) >
+    Number(
+      attachment.size || 0
+    ) >
     maxBytes
   ) {
-    return null;
+    return {
+      ok: false,
+      reason:
+        'Tệp quá lớn để sao lưu trực tiếp',
+      url:
+        attachment.url
+    };
   }
-
-  const controller =
-    new AbortController();
-
-  const timeout =
-    setTimeout(
-      () => controller.abort(),
-      12_000
-    );
-
-  timeout.unref?.();
 
   try {
     const response =
@@ -5286,12 +7459,18 @@ async function downloadAttachmentBuffer(
         attachment.url,
         {
           signal:
-            controller.signal
+            AbortSignal.timeout(
+              15000
+            )
         }
       );
 
-    if (!response.ok) {
-      return null;
+    if (
+      !response.ok
+    ) {
+      throw new Error(
+        `HTTP ${response.status}`
+      );
     }
 
     const declaredLength =
@@ -5305,28 +7484,60 @@ async function downloadAttachmentBuffer(
       declaredLength >
       maxBytes
     ) {
-      return null;
+      return {
+        ok: false,
+        reason:
+          'Tệp quá lớn để sao lưu trực tiếp',
+        url:
+          attachment.url
+      };
     }
 
     const arrayBuffer =
       await response.arrayBuffer();
 
+    const buffer =
+      Buffer.from(
+        arrayBuffer
+      );
+
     if (
-      arrayBuffer.byteLength >
+      buffer.length >
       maxBytes
     ) {
-      return null;
+      return {
+        ok: false,
+        reason:
+          'Tệp quá lớn để sao lưu trực tiếp',
+        url:
+          attachment.url
+      };
     }
 
-    return Buffer.from(
-      arrayBuffer
+    return {
+      ok: true,
+      attachment: {
+        attachment:
+          buffer,
+        name:
+          safeAttachmentName(
+            attachment
+          )
+      }
+    };
+  } catch (error) {
+    logError(
+      'DOWNLOAD_ATTACHMENT',
+      error
     );
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(
-      timeout
-    );
+
+    return {
+      ok: false,
+      reason:
+        'Không thể sao lưu tệp',
+      url:
+        attachment.url
+    };
   }
 }
 
@@ -5334,47 +7545,46 @@ async function archiveAttachments(
   message
 ) {
   const files = [];
-  const failed = [];
+  const descriptions = [];
 
   for (
     const attachment
     of message.attachments.values()
   ) {
-    const buffer =
-      await downloadAttachmentBuffer(
+    const name =
+      safeAttachmentName(
         attachment
       );
 
-    if (!buffer) {
-      failed.push({
-        name:
-          attachment.name ||
-          'tep-dinh-kem',
+    const archived =
+      await downloadAttachmentForLog(
+        attachment
+      );
 
-        url:
-          attachment.url
-      });
+    if (
+      archived.ok
+    ) {
+      files.push(
+        archived.attachment
+      );
 
-      continue;
+      descriptions.push(
+        name
+      );
+    } else {
+      descriptions.push(
+        `${name} ⚠️ ${archived.reason}: ${archived.url}`
+      );
     }
-
-    files.push({
-      attachment:
-        buffer,
-
-      name:
-        attachment.name ||
-        `attachment-${attachment.id}`
-    });
   }
 
   return {
     files,
-    failed
+    descriptions
   };
 }
 
-async function sendMessageArchive(
+async function handleChatMessageCreate(
   message
 ) {
   if (
@@ -5390,104 +7600,208 @@ async function sendMessageArchive(
     );
 
   if (
-    !generator?.tracked_text_channel_id ||
-    String(
-      generator.tracked_text_channel_id
-    ) !==
-    String(message.channelId)
+    !generator?.chat_log_channel_id
   ) {
     return;
   }
-
-  const logChannel =
-    await getLogChannel(
-      message.guild
-    );
 
   if (
-    !logChannel ||
-    logChannel.id ===
-      message.channelId
+    message.channelId ===
+    String(
+      generator.chat_log_channel_id
+    ) ||
+    message.channelId ===
+    String(
+      generator.action_log_channel_id
+    )
   ) {
     return;
   }
 
-  const archive =
+  const authorName =
+    safeMemberName(
+      message.member
+    );
+
+  const content =
+    sanitizeLogText(
+      message.content
+    );
+
+  const links =
+    extractLinks(
+      message.content
+    );
+
+  const archived =
     await archiveAttachments(
       message
     );
 
-  let content =
-    buildMessageLogText(
-      message
+  const lines = [];
+
+  if (content) {
+    lines.push(
+      `💬 ${authorName} » "${quoteLogText(content)}"`
     );
-
-  if (
-    archive.failed.length
-  ) {
-    const fallback =
-      archive.failed
-        .map(
-          item =>
-            `⚠️ Không lưu được ${safeDisplayName(item.name, 60)}: ${item.url}`
-        )
-        .join('\n');
-
-    content =
-      `${content}\n${fallback}`;
+  } else {
+    lines.push(
+      `💬 ${authorName} » Tin nhắn không có nội dung văn bản`
+    );
   }
 
-  await logChannel.send({
+  if (
+    links.length
+  ) {
+    lines.push(
+      `🔗 Liên kết: ${links.join(' • ')}`
+    );
+  }
+
+  if (
+    archived.descriptions.length
+  ) {
+    lines.push(
+      `📎 Tệp đính kèm: ${archived.descriptions.join(' • ')}`
+    );
+  }
+
+  if (
+    lines.length === 1 &&
+    !archived.files.length
+  ) {
+    lines[0] +=
+      ` • ${vietnamTime(message.createdAt)}`;
+  } else {
+    lines.push(
+      vietnamTime(
+        message.createdAt
+      )
+    );
+  }
+
+  const payload = {
     content:
-      truncateText(
-        content,
+      sanitizeLogText(
+        lines.join(
+          '\n'
+        ),
         1900
       ),
-
-    files:
-      archive.files,
-
     allowedMentions: {
       parse: []
     }
-  });
+  };
+
+  if (
+    archived.files.length
+  ) {
+    payload.files =
+      archived.files;
+  }
+
+  const result =
+    await sendChatLog(
+      message.guild,
+      payload
+    );
+
+  if (
+    !result &&
+    archived.files.length
+  ) {
+    const fallbackLines =
+      [
+        ...lines,
+        '⚠️ Không thể tải bản sao tệp lên Blog. URL gốc:',
+        ...[
+          ...message.attachments.values()
+        ].map(
+          attachment =>
+            `${safeAttachmentName(attachment)}: ${attachment.url}`
+        )
+      ];
+
+    await sendChatLog(
+      message.guild,
+      {
+        content:
+          sanitizeLogText(
+            fallbackLines.join(
+              '\n'
+            ),
+            1900
+          ),
+        allowedMentions: {
+          parse: []
+        }
+      }
+    );
+  }
 }
 
-async function logMessageEdit(
+async function handleChatMessageUpdate(
   oldMessage,
   newMessage
 ) {
+  try {
+    if (
+      oldMessage.partial
+    ) {
+      await oldMessage.fetch().catch(
+        () => null
+      );
+    }
+
+    if (
+      newMessage.partial
+    ) {
+      await newMessage.fetch().catch(
+        () => null
+      );
+    }
+  } catch {
+  }
+
+  const message =
+    newMessage ||
+    oldMessage;
+
   if (
-    !newMessage.guild ||
-    newMessage.author?.bot
+    !message?.guild ||
+    message.author?.bot
   ) {
     return;
   }
 
   const generator =
     await getGenerator(
-      newMessage.guild.id
+      message.guild.id
     );
 
   if (
-    !generator?.tracked_text_channel_id ||
-    String(
-      generator.tracked_text_channel_id
-    ) !==
-    String(newMessage.channelId)
+    !generator?.chat_log_channel_id ||
+    message.channelId ===
+      String(
+        generator.chat_log_channel_id
+      ) ||
+    message.channelId ===
+      String(
+        generator.action_log_channel_id
+      )
   ) {
     return;
   }
 
   const before =
-    String(
-      oldMessage?.content || ''
-    ).trim();
+    sanitizeLogText(
+      oldMessage?.content
+    );
 
   const after =
-    String(
-      newMessage?.content || ''
-    ).trim();
+    sanitizeLogText(
+      newMessage?.content
+    );
 
   if (
     before === after
@@ -5495,53 +7809,41 @@ async function logMessageEdit(
     return;
   }
 
-  const logChannel =
-    await getLogChannel(
-      newMessage.guild
-    );
-
-  if (!logChannel) {
-    return;
-  }
-
-  const name =
+  const authorName =
     safeMemberName(
-      newMessage.member
+      newMessage?.member ||
+      oldMessage?.member
     );
 
-  const beforeText =
-    quoteLogText(before) ||
-    '"(trống)"';
-
-  const afterText =
-    quoteLogText(after) ||
-    '"(trống)"';
-
-  const content = [
-    `✏️ ${name} đã sửa tin nhắn`,
-    `Trước: ${beforeText}`,
-    `Sau: ${afterText}`,
+  const lines = [
+    `✏️ ${authorName} » Đã sửa tin nhắn`,
+    `⬅️ Trước: "${quoteLogText(before || '(trống)')}"`,
+    `➡️ Sau: "${quoteLogText(after || '(trống)')}"`,
     vietnamTime()
-  ].join('\n');
+  ];
 
-  await logChannel.send({
-    content:
-      truncateText(
-        content,
-        1900
-      ),
-
-    allowedMentions: {
-      parse: []
+  await sendChatLog(
+    message.guild,
+    {
+      content:
+        sanitizeLogText(
+          lines.join(
+            '\n'
+          ),
+          1900
+        ),
+      allowedMentions: {
+        parse: []
+      }
     }
-  });
+  );
 }
 
-async function logMessageDelete(
+async function handleChatMessageDelete(
   message
 ) {
   if (
-    !message.guild ||
+    !message?.guild ||
     message.author?.bot
   ) {
     return;
@@ -5553,61 +7855,48 @@ async function logMessageDelete(
     );
 
   if (
-    !generator?.tracked_text_channel_id ||
-    String(
-      generator.tracked_text_channel_id
-    ) !==
-    String(message.channelId)
+    !generator?.chat_log_channel_id ||
+    message.channelId ===
+      String(
+        generator.chat_log_channel_id
+      ) ||
+    message.channelId ===
+      String(
+        generator.action_log_channel_id
+      )
   ) {
     return;
   }
 
-  const logChannel =
-    await getLogChannel(
-      message.guild
-    );
-
-  if (!logChannel) {
-    return;
-  }
-
-  const name =
+  const authorName =
     safeMemberName(
       message.member
     );
 
   const content =
-    quoteLogText(
+    sanitizeLogText(
       message.content
     );
 
-  const files =
-    attachmentNames(
-      message
-    );
+  const attachmentNames =
+    message.attachments
+      ? [
+          ...message.attachments.values()
+        ].map(
+          safeAttachmentName
+        )
+      : [];
 
   const lines = [
-    `🗑️ ${name} đã xóa tin nhắn`
+    `🗑️ ${authorName} » Đã xóa tin nhắn`,
+    `💬 Nội dung: "${quoteLogText(content || '(không có nội dung lưu trong bộ nhớ đệm)')}"`
   ];
 
-  if (content) {
-    lines.push(
-      `Nội dung: ${content}`
-    );
-  }
-
-  if (files.length) {
-    lines.push(
-      `📎 Tệp: ${files.join(' • ')}`
-    );
-  }
-
   if (
-    !content &&
-    !files.length
+    attachmentNames.length
   ) {
     lines.push(
-      'Nội dung không còn trong bộ nhớ của bot.'
+      `📎 Tệp: ${attachmentNames.join(' • ')}`
     );
   }
 
@@ -5615,53 +7904,888 @@ async function logMessageDelete(
     vietnamTime()
   );
 
-  await logChannel.send({
-    content:
-      truncateText(
-        lines.join('\n'),
-        1900
-      ),
-
-    allowedMentions: {
-      parse: []
+  await sendChatLog(
+    message.guild,
+    {
+      content:
+        sanitizeLogText(
+          lines.join(
+            '\n'
+          ),
+          1900
+        ),
+      allowedMentions: {
+        parse: []
+      }
     }
-  });
+  );
 }
-
-async function sendActionLog(
-  guild,
-  text
+async function handlePanelCommand(
+  interaction
 ) {
-  const logChannel =
-    await getLogChannel(
-      guild
+  await safeDeferReply(
+    interaction,
+    true
+  );
+
+  if (
+    !interaction.guild
+  ) {
+    await tempReply(
+      interaction,
+      '❌ Lệnh này chỉ sử dụng trong server.',
+      {
+        error: true
+      }
     );
 
-  if (!logChannel) {
     return;
   }
 
-  await logChannel.send({
-    content:
-      `${truncateText(
-        text,
-        1750
-      )} • ${vietnamTime()}`,
+  const member =
+    await getGuildMember(
+      interaction.guild,
+      interaction.user.id
+    );
 
-    allowedMentions: {
-      parse: []
+  if (!member) {
+    await tempReply(
+      interaction,
+      '❌ Không tìm thấy thông tin thành viên.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  let room = null;
+
+  if (
+    member.voice?.channelId
+  ) {
+    room =
+      await getRoom(
+        member.voice.channelId
+      );
+  }
+
+  if (!room) {
+    room =
+      await getOwnedRoom(
+        interaction.guild.id,
+        interaction.user.id
+      );
+  }
+
+  if (!room) {
+    await tempReply(
+      interaction,
+      '❌ Bạn chưa có phòng Voice HDK.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  if (
+    String(
+      room.owner_id
+    ) !==
+    interaction.user.id
+  ) {
+    await tempReply(
+      interaction,
+      '❌ Bạn không phải chủ phòng hiện tại.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  let channel =
+    interaction.guild.channels.cache.get(
+      String(
+        room.channel_id
+      )
+    );
+
+  if (!channel) {
+    channel =
+      await interaction.guild.channels.fetch(
+        String(
+          room.channel_id
+        )
+      ).catch(
+        () => null
+      );
+  }
+
+  if (
+    !channel ||
+    channel.type !==
+      ChannelType.GuildVoice
+  ) {
+    await deleteRoomRecord(
+      String(
+        room.channel_id
+      )
+    );
+
+    await tempReply(
+      interaction,
+      '❌ Phòng không còn tồn tại. Dữ liệu cũ đã được dọn.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const panel =
+    await refreshRoomPanelSafe(
+      channel.id,
+      {
+        forceRebuild: true
+      }
+    );
+
+  if (!panel) {
+    await tempReply(
+      interaction,
+      '❌ Không thể khôi phục bảng điều khiển phòng.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  await sendActionLog(
+    interaction.guild,
+    '🛠️',
+    interaction.member,
+    `Khôi phục bảng điều khiển phòng ${channel.name}`
+  );
+
+  await tempReply(
+    interaction,
+    `✅ Đã khôi phục bảng điều khiển tại ${channel}.`
+  );
+}
+
+async function handleClaimCommand(
+  interaction
+) {
+  await safeDeferReply(
+    interaction,
+    true
+  );
+
+  if (
+    !interaction.guild
+  ) {
+    await tempReply(
+      interaction,
+      '❌ Lệnh này chỉ sử dụng trong server.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const member =
+    await getGuildMember(
+      interaction.guild,
+      interaction.user.id
+    );
+
+  if (
+    !member ||
+    !member.voice?.channelId
+  ) {
+    await tempReply(
+      interaction,
+      '❌ Bạn phải đang ở trong một phòng Voice HDK.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const room =
+    await getRoom(
+      member.voice.channelId
+    );
+
+  if (!room) {
+    await tempReply(
+      interaction,
+      '❌ Phòng hiện tại không phải phòng Voice HDK.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const channel =
+    member.voice.channel;
+
+  try {
+    await claimRoom(
+      channel,
+      member
+    );
+
+    await sendActionLog(
+      interaction.guild,
+      '👑',
+      member,
+      `Nhận quyền chủ phòng ${channel.name}`
+    );
+
+    await tempReply(
+      interaction,
+      '👑 Bạn đã trở thành chủ phòng mới.'
+    );
+  } catch (error) {
+    logError(
+      'CLAIM_ROOM',
+      error
+    );
+
+    await tempReply(
+      interaction,
+      `❌ ${String(
+        error?.message ||
+        'Không thể nhận quyền chủ phòng.'
+      ).slice(
+        0,
+        1000
+      )}`,
+      {
+        error: true
+      }
+    );
+  }
+}
+
+async function doctorGuild(
+  guild
+) {
+  const checks = [];
+
+  try {
+    await pool.query(
+      'SELECT 1'
+    );
+
+    checks.push(
+      '✅ PostgreSQL: hoạt động'
+    );
+  } catch {
+    checks.push(
+      '❌ PostgreSQL: lỗi kết nối'
+    );
+  }
+
+  if (
+    client.isReady()
+  ) {
+    checks.push(
+      `✅ Discord Gateway: ${Math.round(
+        client.ws.ping
+      )} ms`
+    );
+  } else {
+    checks.push(
+      '❌ Discord Gateway: chưa sẵn sàng'
+    );
+  }
+
+  const generator =
+    await getGenerator(
+      guild.id
+    );
+
+  if (!generator) {
+    checks.push(
+      '❌ Cài đặt: server chưa chạy /setup'
+    );
+
+    return checks;
+  }
+
+  checks.push(
+    `✅ Cài đặt: ${cleanDisplayName(
+      generator.display_name
+    ) || 'Đã cấu hình'}`
+  );
+
+  const botMember =
+    await getBotMember(
+      guild
+    );
+
+  if (!botMember) {
+    checks.push(
+      '❌ Bot Member: không thể tải'
+    );
+  } else {
+    const missing =
+      missingPermissions(
+        botMember.permissions
+      );
+
+    if (
+      missing.length
+    ) {
+      checks.push(
+        `❌ Quyền Bot: thiếu ${permissionNames(
+          missing
+        ).join(
+          ', '
+        )}`
+      );
+    } else {
+      checks.push(
+        '✅ Quyền Bot: đủ quyền hệ thống'
+      );
     }
-  });
+  }
+
+  const resources = [
+    [
+      'Danh mục đặt nút',
+      generator.button_category_id,
+      ChannelType.GuildCategory
+    ],
+    [
+      'Danh mục Blog',
+      generator.blog_category_id,
+      ChannelType.GuildCategory
+    ],
+    [
+      'Kênh tạo phòng',
+      generator.create_channel_id,
+      ChannelType.GuildText
+    ],
+    [
+      'Blog Chat',
+      generator.chat_log_channel_id,
+      ChannelType.GuildText
+    ],
+    [
+      'Blog Chức năng',
+      generator.action_log_channel_id,
+      ChannelType.GuildText
+    ]
+  ];
+
+  for (
+    const [
+      name,
+      id,
+      expectedType
+    ]
+    of resources
+  ) {
+    if (
+      !isSnowflake(
+        String(
+          id
+        )
+      )
+    ) {
+      checks.push(
+        `❌ ${name}: chưa có ID`
+      );
+
+      continue;
+    }
+
+    let channel =
+      guild.channels.cache.get(
+        String(
+          id
+        )
+      );
+
+    if (!channel) {
+      channel =
+        await guild.channels.fetch(
+          String(
+            id
+          )
+        ).catch(
+          () => null
+        );
+    }
+
+    if (!channel) {
+      checks.push(
+        `❌ ${name}: không tồn tại`
+      );
+
+      continue;
+    }
+
+    if (
+      channel.type !==
+      expectedType
+    ) {
+      checks.push(
+        `❌ ${name}: sai loại kênh`
+      );
+
+      continue;
+    }
+
+    checks.push(
+      `✅ ${name}: hoạt động`
+    );
+  }
+
+  try {
+    const regions =
+      await getVoiceRegions(
+        true
+      );
+
+    checks.push(
+      regions.length
+        ? `✅ Voice Region: ${regions.length} khu vực khả dụng`
+        : '⚠️ Voice Region: Discord trả về danh sách rỗng'
+    );
+  } catch {
+    checks.push(
+      '❌ Voice Region: không thể kiểm tra'
+    );
+  }
+
+  const rooms =
+    await getGuildRooms(
+      guild.id
+    );
+
+  let validRooms = 0;
+  let staleRooms = 0;
+
+  for (
+    const room
+    of rooms
+  ) {
+    let channel =
+      guild.channels.cache.get(
+        String(
+          room.channel_id
+        )
+      );
+
+    if (!channel) {
+      channel =
+        await guild.channels.fetch(
+          String(
+            room.channel_id
+          )
+        ).catch(
+          () => null
+        );
+    }
+
+    if (
+      channel &&
+      channel.type ===
+        ChannelType.GuildVoice
+    ) {
+      validRooms++;
+    } else {
+      staleRooms++;
+    }
+  }
+
+  checks.push(
+    staleRooms
+      ? `⚠️ Phòng: ${validRooms} hợp lệ, ${staleRooms} dữ liệu cũ`
+      : `✅ Phòng: ${validRooms} phòng hợp lệ`
+  );
+
+  return checks;
+}
+
+async function handleDoctorCommand(
+  interaction
+) {
+  await safeDeferReply(
+    interaction,
+    true
+  );
+
+  if (
+    !interaction.guild
+  ) {
+    await tempReply(
+      interaction,
+      '❌ Lệnh này chỉ sử dụng trong server.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  if (
+    !canManageSetup(
+      interaction
+    )
+  ) {
+    await tempReply(
+      interaction,
+      '❌ Bạn cần quyền **Quản lý Server** để kiểm tra hệ thống.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  try {
+    const checks =
+      await doctorGuild(
+        interaction.guild
+      );
+
+    const embed =
+      new EmbedBuilder()
+        .setTitle(
+          '🩺 KIỂM TRA VOICE HDK'
+        )
+        .setDescription(
+          checks.join(
+            '\n'
+          )
+        )
+        .setFooter({
+          text:
+            `✦ ${BOT_NAME} • ${BOT_VERSION}`
+        })
+        .setTimestamp();
+
+    await interaction.editReply({
+      embeds: [
+        embed
+      ]
+    });
+  } catch (error) {
+    logError(
+      'DOCTOR',
+      error
+    );
+
+    await tempReply(
+      interaction,
+      '❌ Không thể hoàn tất kiểm tra hệ thống.',
+      {
+        error: true
+      }
+    );
+  }
+}
+
+async function reconcileCreateMessage(
+  guild,
+  generator
+) {
+  if (
+    !generator?.create_channel_id
+  ) {
+    return;
+  }
+
+  let channel =
+    guild.channels.cache.get(
+      String(
+        generator.create_channel_id
+      )
+    );
+
+  if (!channel) {
+    channel =
+      await guild.channels.fetch(
+        String(
+          generator.create_channel_id
+        )
+      ).catch(
+        () => null
+      );
+  }
+
+  if (
+    !channel ||
+    !channel.isTextBased()
+  ) {
+    return;
+  }
+
+  let message =
+    await fetchMessageSafe(
+      channel,
+      String(
+        generator.create_message_id ||
+        ''
+      )
+    );
+
+  if (!message) {
+    try {
+      const recent =
+        await channel.messages.fetch({
+          limit: 50
+        });
+
+      message =
+        recent.find(
+          item =>
+            item.author?.id ===
+              client.user.id &&
+            item.components?.some(
+              row =>
+                row.components?.some(
+                  component =>
+                    (
+                      component.customId ||
+                      component.custom_id
+                    ) ===
+                    'room_create'
+                )
+            )
+        ) || null;
+    } catch (error) {
+      logError(
+        'RECONCILE_CREATE_MESSAGE_SCAN',
+        error
+      );
+    }
+  }
+
+  const payload =
+    buildCreateRoomPanel(
+      generator.display_name
+    );
+
+  if (message) {
+    try {
+      await message.edit(
+        payload
+      );
+    } catch (error) {
+      logError(
+        'RECONCILE_CREATE_MESSAGE_EDIT',
+        error
+      );
+
+      message = null;
+    }
+  }
+
+  if (!message) {
+    message =
+      await channel.send(
+        payload
+      );
+  }
+
+  if (
+    String(
+      generator.create_message_id ||
+      ''
+    ) !==
+    message.id
+  ) {
+    await pool.query(
+      `
+        UPDATE generators
+        SET
+          create_message_id = $1,
+          updated_at = NOW()
+        WHERE guild_id = $2
+      `,
+      [
+        message.id,
+        guild.id
+      ]
+    );
+  }
+}
+
+async function reconcileGuild(
+  guild
+) {
+  const generator =
+    await getGenerator(
+      guild.id
+    );
+
+  if (generator) {
+    await reconcileCreateMessage(
+      guild,
+      generator
+    ).catch(
+      error => {
+        logError(
+          `RECONCILE_GENERATOR:${guild.id}`,
+          error
+        );
+      }
+    );
+  }
+
+  const rooms =
+    await getGuildRooms(
+      guild.id
+    );
+
+  for (
+    const room
+    of rooms
+  ) {
+    try {
+      let channel =
+        guild.channels.cache.get(
+          String(
+            room.channel_id
+          )
+        );
+
+      if (!channel) {
+        channel =
+          await guild.channels.fetch(
+            String(
+              room.channel_id
+            )
+          ).catch(
+            () => null
+          );
+      }
+
+      if (
+        !channel ||
+        channel.type !==
+          ChannelType.GuildVoice
+      ) {
+        await deleteRoomRecord(
+          String(
+            room.channel_id
+          )
+        );
+
+        continue;
+      }
+
+      const owner =
+        await getGuildMember(
+          guild,
+          String(
+            room.owner_id
+          )
+        );
+
+      if (!owner) {
+        const candidates =
+          channel.members.filter(
+            member =>
+              !member.user.bot
+          );
+
+        const replacement =
+          candidates.first();
+
+        if (replacement) {
+          await updateRoomOwner(
+            channel.id,
+            replacement.id
+          );
+
+          await grantOwnerPermissions(
+            channel,
+            replacement.id
+          );
+        }
+      } else {
+        await grantOwnerPermissions(
+          channel,
+          owner.id
+        );
+      }
+
+      await ensureBotRoomPermissions(
+        channel
+      );
+
+      const humans =
+        channel.members.filter(
+          member =>
+            !member.user.bot
+        );
+
+      if (
+        humans.size === 0
+      ) {
+        scheduleEmptyRoomCheck(
+          channel.id,
+          3000
+        );
+      } else {
+        await refreshRoomPanelSafe(
+          channel.id
+        );
+      }
+    } catch (error) {
+      logError(
+        `RECONCILE_ROOM:${room.channel_id}`,
+        error
+      );
+    }
+  }
+}
+
+async function reconcileAllGuilds() {
+  for (
+    const guild
+    of client.guilds.cache.values()
+  ) {
+    await reconcileGuild(
+      guild
+    ).catch(
+      error => {
+        logError(
+          `RECONCILE_GUILD:${guild.id}`,
+          error
+        );
+      }
+    );
+  }
 }
 
 async function handleVoiceStateUpdate(
   oldState,
   newState
 ) {
-  const guild =
-    newState.guild ||
-    oldState.guild;
-
   const oldChannelId =
     oldState.channelId;
 
@@ -5675,7 +8799,9 @@ async function handleVoiceStateUpdate(
     return;
   }
 
-  if (oldChannelId) {
+  if (
+    oldChannelId
+  ) {
     const oldRoom =
       await getRoom(
         oldChannelId
@@ -5692,7 +8818,9 @@ async function handleVoiceStateUpdate(
     }
   }
 
-  if (newChannelId) {
+  if (
+    newChannelId
+  ) {
     const newRoom =
       await getRoom(
         newChannelId
@@ -5704,680 +8832,179 @@ async function handleVoiceStateUpdate(
       );
     }
   }
-
-  if (
-    oldChannelId &&
-    newChannelId
-  ) {
-    await sendActionLog(
-      guild,
-      `🔊 ${safeMemberName(newState.member)} chuyển phòng thoại`
-    ).catch(
-      error => {
-        logError(
-          'VOICE_MOVE_LOG',
-          error,
-          {
-            guildId:
-              guild.id,
-
-            userId:
-              newState.id
-          }
-        );
-      }
-    );
-  }
 }
 
-async function reconcileRooms() {
-  const result =
-    await pool.query(`
-      SELECT *
-      FROM rooms
-      ORDER BY created_at ASC
-    `);
-
-  for (
-    const room
-    of result.rows
-  ) {
-    try {
-      const guild =
-        client.guilds.cache.get(
-          String(room.guild_id)
-        );
-
-      if (!guild) {
-        await deleteRoomRecord(
-          room.channel_id
-        );
-
-        continue;
-      }
-
-      const channel =
-        await guild.channels
-          .fetch(
-            room.channel_id
-          )
-          .catch(() => null);
-
-      if (
-        !channel ||
-        channel.type !==
-          ChannelType.GuildVoice
-      ) {
-        await deleteRoomRecord(
-          room.channel_id
-        );
-
-        continue;
-      }
-
-      const owner =
-        await guild.members
-          .fetch(
-            room.owner_id
-          )
-          .catch(() => null);
-
-      if (!owner) {
-        const humans =
-          channel.members.filter(
-            member =>
-              !member.user.bot
-          );
-
-        if (
-          humans.size === 0
-        ) {
-          await deleteTempRoom(
-            channel,
-            'Chủ phòng không còn trong máy chủ'
-          );
-
-          continue;
-        }
-
-        const replacement =
-          humans.first();
-
-        await updateRoomOwner(
-          channel.id,
-          room.owner_id,
-          replacement.id
-        );
-
-        await grantOwnerPermissions(
-          channel,
-          replacement.id
-        );
-
-        await removeOwnerPermissions(
-          channel,
-          room.owner_id
-        );
-      }
-
-      await ensureBotRoomPermissions(
-        channel
-      );
-
-      await refreshRoomPanelSafe(
-        channel.id
-      );
-
-      const humans =
-        channel.members.filter(
-          member =>
-            !member.user.bot
-        );
-
-      if (
-        humans.size === 0
-      ) {
-        scheduleEmptyRoomCheck(
-          channel.id
-        );
-      }
-    } catch (error) {
-      logError(
-        'RECONCILE_ROOM',
-        error,
-        {
-          channelId:
-            room.channel_id,
-
-          guildId:
-            room.guild_id
-        }
-      );
-    }
-  }
-}
-
-async function handlePanelCommand(
-  interaction
+async function handleChannelDelete(
+  channel
 ) {
-  if (!interaction.guild) {
-    return tempReply(
-      interaction,
-      '❌ Lệnh này chỉ dùng trong máy chủ.',
-      {
-        error: true
-      }
-    );
-  }
-
-  await interaction.deferReply({
-    ephemeral: true
-  });
-
-  let channelId =
-    interaction.channelId;
-
-  let room =
-    await getRoom(
-      channelId
-    );
-
-  if (!room) {
-    room =
-      await getOwnedRoom(
-        interaction.guild.id,
-        interaction.user.id
-      );
-
-    if (room) {
-      channelId =
-        room.channel_id;
-    }
-  }
-
-  if (!room) {
-    return tempReply(
-      interaction,
-      '❌ Không tìm thấy phòng Temp Voice của bạn.',
-      {
-        error: true
-      }
-    );
-  }
-
-  const isOwner =
-    String(room.owner_id) ===
-    String(interaction.user.id);
-
-  const canManage =
-    interaction.memberPermissions?.has(
-      PermissionsBitField.Flags.ManageGuild
-    );
-
   if (
-    !isOwner &&
-    !canManage
+    !channel?.guild
   ) {
-    return tempReply(
-      interaction,
-      '⛔ Bạn không có quyền dựng lại panel của phòng này.',
-      {
-        error: true
-      }
-    );
-  }
-
-  const panel =
-    await refreshRoomPanel(
-      channelId
-    );
-
-  if (!panel) {
-    return tempReply(
-      interaction,
-      '❌ Không thể dựng lại panel.',
-      {
-        error: true
-      }
-    );
-  }
-
-  await tempReply(
-    interaction,
-    '✅ Panel đã được kiểm tra và khôi phục.'
-  );
-}
-
-async function handleDoctorCommand(
-  interaction
-) {
-  if (!interaction.guild) {
-    return tempReply(
-      interaction,
-      '❌ Lệnh này chỉ dùng trong máy chủ.',
-      {
-        error: true
-      }
-    );
-  }
-
-  if (
-    !interaction.memberPermissions?.has(
-      PermissionsBitField.Flags.ManageGuild
-    )
-  ) {
-    return tempReply(
-      interaction,
-      '⛔ Bạn cần quyền Quản lý máy chủ.',
-      {
-        error: true
-      }
-    );
-  }
-
-  await interaction.deferReply({
-    ephemeral: true
-  });
-
-  const checks = [];
-
-  try {
-    await pool.query(
-      'SELECT 1'
-    );
-
-    checks.push(
-      '✅ PostgreSQL'
-    );
-  } catch {
-    checks.push(
-      '❌ PostgreSQL'
-    );
-  }
-
-  checks.push(
-    client.isReady()
-      ? '✅ Discord Gateway'
-      : '❌ Discord Gateway'
-  );
-
-  const generator =
-    await getGenerator(
-      interaction.guild.id
-    ).catch(() => null);
-
-  if (generator) {
-    checks.push(
-      '✅ Cấu hình máy chủ'
-    );
-  } else {
-    checks.push(
-      '❌ Chưa /setup'
-    );
-  }
-
-  const missing =
-    getMissingPermissions(
-      interaction.guild
-    );
-
-  if (!missing.length) {
-    checks.push(
-      '✅ Quyền bot'
-    );
-  } else {
-    checks.push(
-      `❌ Thiếu quyền: ${permissionNames(
-        missing
-      ).join(', ')}`
-    );
-  }
-
-  if (
-    generator?.setup_channel_id
-  ) {
-    const setupChannel =
-      await interaction.guild.channels
-        .fetch(
-          generator.setup_channel_id
-        )
-        .catch(() => null);
-
-    if (
-      setupChannel &&
-      setupChannel.isTextBased()
-    ) {
-      checks.push(
-        '✅ Kênh Tạo phòng'
-      );
-    } else {
-      checks.push(
-        '❌ Kênh Tạo phòng'
-      );
-    }
-  }
-
-  try {
-    const regions =
-      await getVoiceRegions(
-        true
-      );
-
-    checks.push(
-      regions.length
-        ? `✅ Voice Regions (${regions.length})`
-        : '⚠️ Voice Regions trống'
-    );
-  } catch {
-    checks.push(
-      '❌ Voice Regions'
-    );
-  }
-
-  await interaction.editReply({
-    content: [
-      '**🩺 Voice HDK Doctor**',
-      '',
-      ...checks
-    ].join('\n')
-  });
-}
-
-async function showLogSetupModal(
-  interaction
-) {
-  const modal =
-    new ModalBuilder()
-      .setCustomId(
-        'log_setup_modal'
-      )
-      .setTitle(
-        'Thiết lập nhật ký'
-      );
-
-  const trackedInput =
-    new TextInputBuilder()
-      .setCustomId(
-        'log_tracked_channel'
-      )
-      .setLabel(
-        'ID kênh cần theo dõi'
-      )
-      .setPlaceholder(
-        'Ví dụ: 123456789012345678'
-      )
-      .setStyle(
-        TextInputStyle.Short
-      )
-      .setRequired(true);
-
-  const logInput =
-    new TextInputBuilder()
-      .setCustomId(
-        'log_output_channel'
-      )
-      .setLabel(
-        'ID kênh nhận nhật ký'
-      )
-      .setPlaceholder(
-        'Ví dụ: 123456789012345678'
-      )
-      .setStyle(
-        TextInputStyle.Short
-      )
-      .setRequired(true);
-
-  modal.addComponents(
-    new ActionRowBuilder()
-      .addComponents(
-        trackedInput
-      ),
-
-    new ActionRowBuilder()
-      .addComponents(
-        logInput
-      )
-  );
-
-  await interaction.showModal(
-    modal
-  );
-}
-
-async function handleLogSetupModal(
-  interaction
-) {
-  if (!interaction.guild) {
     return;
   }
 
-  if (
-    !interaction.memberPermissions?.has(
-      PermissionsBitField.Flags.ManageGuild
-    )
-  ) {
-    return tempReply(
-      interaction,
-      '⛔ Bạn cần quyền Quản lý máy chủ.',
-      {
-        error: true
-      }
+  try {
+    const room =
+      await getRoom(
+        channel.id
+      );
+
+    if (room) {
+      clearPendingTransfer(
+        channel.id
+      );
+
+      clearSelectionsForChannel(
+        channel.guild.id,
+        channel.id
+      );
+
+      await deleteRoomRecord(
+        channel.id
+      );
+
+      await sendActionLog(
+        channel.guild,
+        '🗑️',
+        BOT_NAME,
+        `Xóa dữ liệu phòng ${channel.name}`
+      );
+
+      return;
+    }
+
+    const generator =
+      await getGenerator(
+        channel.guild.id
+      );
+
+    if (!generator) {
+      return;
+    }
+
+    const updates = [];
+
+    if (
+      String(
+        generator.create_channel_id ||
+        ''
+      ) ===
+      channel.id
+    ) {
+      updates.push(
+        'create_channel_id = NULL',
+        'create_message_id = NULL'
+      );
+    }
+
+    if (
+      String(
+        generator.chat_log_channel_id ||
+        ''
+      ) ===
+      channel.id
+    ) {
+      updates.push(
+        'chat_log_channel_id = NULL'
+      );
+    }
+
+    if (
+      String(
+        generator.action_log_channel_id ||
+        ''
+      ) ===
+      channel.id
+    ) {
+      updates.push(
+        'action_log_channel_id = NULL'
+      );
+    }
+
+    if (
+      String(
+        generator.button_category_id ||
+        ''
+      ) ===
+      channel.id
+    ) {
+      updates.push(
+        'button_category_id = NULL'
+      );
+    }
+
+    if (
+      String(
+        generator.blog_category_id ||
+        ''
+      ) ===
+      channel.id
+    ) {
+      updates.push(
+        'blog_category_id = NULL'
+      );
+    }
+
+    if (
+      updates.length
+    ) {
+      await pool.query(
+        `
+          UPDATE generators
+          SET
+            ${updates.join(', ')},
+            updated_at = NOW()
+          WHERE guild_id = $1
+        `,
+        [
+          channel.guild.id
+        ]
+      );
+    }
+  } catch (error) {
+    logError(
+      'CHANNEL_DELETE',
+      error
     );
   }
-
-  await interaction.deferReply({
-    ephemeral: true
-  });
-
-  const trackedId =
-    interaction.fields
-      .getTextInputValue(
-        'log_tracked_channel'
-      )
-      .trim();
-
-  const logId =
-    interaction.fields
-      .getTextInputValue(
-        'log_output_channel'
-      )
-      .trim();
-
-  if (
-    !isSnowflake(trackedId) ||
-    !isSnowflake(logId)
-  ) {
-    return tempReply(
-      interaction,
-      '❌ ID kênh không hợp lệ.',
-      {
-        error: true
-      }
-    );
-  }
-
-  if (
-    trackedId === logId
-  ) {
-    return tempReply(
-      interaction,
-      '❌ Kênh theo dõi và kênh nhật ký phải khác nhau.',
-      {
-        error: true
-      }
-    );
-  }
-
-  const trackedChannel =
-    await interaction.guild.channels
-      .fetch(trackedId)
-      .catch(() => null);
-
-  const logChannel =
-    await interaction.guild.channels
-      .fetch(logId)
-      .catch(() => null);
-
-  if (
-    !trackedChannel ||
-    !trackedChannel.isTextBased() ||
-    !logChannel ||
-    !logChannel.isTextBased()
-  ) {
-    return tempReply(
-      interaction,
-      '❌ Một trong hai kênh không phải kênh văn bản hợp lệ.',
-      {
-        error: true
-      }
-    );
-  }
-
-  const generator =
-    await getGenerator(
-      interaction.guild.id
-    );
-
-  if (!generator) {
-    return tempReply(
-      interaction,
-      '❌ Hãy chạy /setup trước.',
-      {
-        error: true
-      }
-    );
-  }
-
-  const me =
-    interaction.guild.members.me ||
-    await interaction.guild.members
-      .fetchMe();
-
-  const trackedPerms =
-    trackedChannel.permissionsFor(
-      me
-    );
-
-  const logPerms =
-    logChannel.permissionsFor(
-      me
-    );
-
-  if (
-    !trackedPerms?.has(
-      PermissionsBitField.Flags.ViewChannel
-    ) ||
-    !trackedPerms?.has(
-      PermissionsBitField.Flags.ReadMessageHistory
-    )
-  ) {
-    return tempReply(
-      interaction,
-      '❌ Bot thiếu quyền xem/đọc lịch sử tại kênh cần theo dõi.',
-      {
-        error: true
-      }
-    );
-  }
-
-  if (
-    !logPerms?.has(
-      PermissionsBitField.Flags.ViewChannel
-    ) ||
-    !logPerms?.has(
-      PermissionsBitField.Flags.SendMessages
-    )
-  ) {
-    return tempReply(
-      interaction,
-      '❌ Bot thiếu quyền xem/gửi tin nhắn tại kênh nhật ký.',
-      {
-        error: true
-      }
-    );
-  }
-
-  await pool.query(
-    `
-      UPDATE generators
-      SET
-        tracked_text_channel_id=$1,
-        blog_channel_id=$2
-      WHERE guild_id=$3
-    `,
-    [
-      trackedChannel.id,
-      logChannel.id,
-      interaction.guild.id
-    ]
-  );
-
-  await tempReply(
-    interaction,
-    `✅ Theo dõi <#${trackedChannel.id}> → nhật ký <#${logChannel.id}>.`
-  );
-}
-async function handleLogSetupCommand(
-  interaction
-) {
-  if (!interaction.guild) {
-    return tempReply(
-      interaction,
-      '❌ Lệnh này chỉ dùng trong máy chủ.',
-      {
-        error: true
-      }
-    );
-  }
-
-  if (
-    !interaction.memberPermissions?.has(
-      PermissionsBitField.Flags.ManageGuild
-    )
-  ) {
-    return tempReply(
-      interaction,
-      '⛔ Bạn cần quyền Quản lý máy chủ.',
-      {
-        error: true
-      }
-    );
-  }
-
-  await showLogSetupModal(
-    interaction
-  );
 }
 
 async function registerCommands() {
   const commands = [
     new SlashCommandBuilder()
-      .setName('setup')
-      .setDescription(
-        'Thiết lập Voice HDK'
+      .setName(
+        'setup'
       )
-      .setDMPermission(false),
-
+      .setDescription(
+        'Cài đặt hoặc cài đặt lại Voice HDK'
+      )
+      .setDefaultMemberPermissions(
+        PermissionsBitField.Flags.ManageGuild
+      ),
     new SlashCommandBuilder()
-      .setName('panel')
-      .setDescription(
-        'Kiểm tra và khôi phục panel phòng'
+      .setName(
+        'panel'
       )
-      .setDMPermission(false),
-
+      .setDescription(
+        'Khôi phục bảng điều khiển phòng Voice HDK'
+      ),
     new SlashCommandBuilder()
-      .setName('doctor')
-      .setDescription(
-        'Kiểm tra trạng thái Voice HDK'
+      .setName(
+        'claim'
       )
-      .setDMPermission(false),
-
+      .setDescription(
+        'Nhận quyền chủ khi chủ cũ không còn trong phòng'
+      ),
     new SlashCommandBuilder()
-      .setName('logsetup')
-      .setDescription(
-        'Thiết lập kênh theo dõi và nhật ký'
+      .setName(
+        'doctor'
       )
-      .setDMPermission(false)
+      .setDescription(
+        'Kiểm tra trạng thái hệ thống Voice HDK'
+      )
+      .setDefaultMemberPermissions(
+        PermissionsBitField.Flags.ManageGuild
+      )
   ].map(
     command =>
       command.toJSON()
@@ -6391,29 +9018,35 @@ async function registerCommands() {
 async function handleInteraction(
   interaction
 ) {
-  if (interaction.isChatInputCommand()) {
+  if (
+    interaction.isChatInputCommand()
+  ) {
     switch (
       interaction.commandName
     ) {
       case 'setup':
-        return handleSetupCommand(
+        await handleSetupCommand(
           interaction
         );
+        return;
 
       case 'panel':
-        return handlePanelCommand(
+        await handlePanelCommand(
           interaction
         );
+        return;
+
+      case 'claim':
+        await handleClaimCommand(
+          interaction
+        );
+        return;
 
       case 'doctor':
-        return handleDoctorCommand(
+        await handleDoctorCommand(
           interaction
         );
-
-      case 'logsetup':
-        return handleLogSetupCommand(
-          interaction
-        );
+        return;
 
       default:
         return;
@@ -6421,659 +9054,405 @@ async function handleInteraction(
   }
 
   if (
-    interaction.isChannelSelectMenu() &&
-    interaction.customId ===
-      'setup_channel'
+    interaction.isModalSubmit()
   ) {
-    return handleSetupChannelSelect(
-      interaction
-    );
-  }
-
-  if (
-    interaction.isUserSelectMenu() &&
-    interaction.customId ===
-      'vc_member_select'
-  ) {
-    return handleMemberSelect(
-      interaction
-    );
-  }
-
-  if (
-    interaction.isStringSelectMenu() &&
-    interaction.customId ===
-      'vc_region'
-  ) {
-    return handleRegionSelect(
-      interaction
-    );
-  }
-
-  if (interaction.isModalSubmit()) {
     switch (
       interaction.customId
     ) {
       case 'setup_name_modal':
-        return handleSetupNameModal(
+        await handleSetupNameModal(
           interaction
         );
+        return;
 
-      case 'vc_rename_modal':
-        return handleRenameModal(
+      case 'room_rename_modal':
+        await handleRenameModal(
           interaction
         );
+        return;
 
-      case 'vc_limit_modal':
-        return handleLimitModal(
+      case 'room_limit_modal':
+        await handleLimitModal(
           interaction
         );
-
-      case 'log_setup_modal':
-        return handleLogSetupModal(
-          interaction
-        );
+        return;
 
       default:
         return;
     }
   }
 
-  if (!interaction.isButton()) {
+  if (
+    interaction.isChannelSelectMenu()
+  ) {
+    switch (
+      interaction.customId
+    ) {
+      case 'setup_button_category':
+        await handleSetupCategorySelect(
+          interaction,
+          'button'
+        );
+        return;
+
+      case 'setup_blog_category':
+        await handleSetupCategorySelect(
+          interaction,
+          'blog'
+        );
+        return;
+
+      default:
+        return;
+    }
+  }
+
+  if (
+    interaction.isUserSelectMenu()
+  ) {
+    if (
+      interaction.customId ===
+      'room_member'
+    ) {
+      await handleMemberSelect(
+        interaction
+      );
+    }
+
     return;
   }
 
   if (
-    interaction.customId.startsWith(
-      'transfer_accept:'
-    )
+    interaction.isStringSelectMenu()
   ) {
-    const channelId =
-      interaction.customId.slice(
-        'transfer_accept:'.length
-      );
-
-    if (!isSnowflake(channelId)) {
-      return tempReply(
-        interaction,
-        '❌ Yêu cầu chuyển chủ không hợp lệ.',
-        {
-          error: true
-        }
+    if (
+      interaction.customId ===
+      'room_region'
+    ) {
+      await handleRegionSelect(
+        interaction
       );
     }
 
-    return handleTransferResponse(
-      interaction,
-      'accept',
-      channelId
-    );
+    return;
   }
 
   if (
-    interaction.customId.startsWith(
-      'transfer_decline:'
-    )
+    interaction.isButton()
   ) {
-    const channelId =
-      interaction.customId.slice(
-        'transfer_decline:'.length
+    if (
+      interaction.customId.startsWith(
+        'transfer_accept:'
+      ) ||
+      interaction.customId.startsWith(
+        'transfer_decline:'
+      )
+    ) {
+      await handleTransferDecision(
+        interaction
       );
 
-    if (!isSnowflake(channelId)) {
-      return tempReply(
-        interaction,
-        '❌ Yêu cầu chuyển chủ không hợp lệ.',
-        {
-          error: true
-        }
-      );
+      return;
     }
 
-    return handleTransferResponse(
-      interaction,
-      'decline',
-      channelId
-    );
-  }
+    switch (
+      interaction.customId
+    ) {
+      case 'setup_name':
+        await handleSetupNameButton(
+          interaction
+        );
+        return;
 
-  switch (
-    interaction.customId
-  ) {
-    case 'setup_name':
-      return showSetupNameModal(
-        interaction
-      );
+      case 'setup_reinstall_confirm':
+        await handleReinstallConfirm(
+          interaction
+        );
+        return;
 
-    case 'setup_confirm':
-      return handleSetupConfirm(
-        interaction
-      );
+      case 'setup_reinstall_cancel':
+        await handleReinstallCancel(
+          interaction
+        );
+        return;
 
-    case 'voice_create':
-      return handleCreateRoomButton(
-        interaction
-      );
+      case 'setup_install':
+        await handleSetupInstall(
+          interaction
+        );
+        return;
 
-    case 'vc_lock':
-      return handleLockButton(
-        interaction,
-        true
-      );
+      case 'room_create':
+        await handleCreateRoomButton(
+          interaction
+        );
+        return;
 
-    case 'vc_unlock':
-      return handleLockButton(
-        interaction,
-        false
-      );
+      case 'room_lock':
+        await handleRoomLock(
+          interaction
+        );
+        return;
 
-    case 'vc_hide':
-      return handleHideButton(
-        interaction,
-        true
-      );
+      case 'room_hide':
+        await handleRoomHide(
+          interaction
+        );
+        return;
 
-    case 'vc_show':
-      return handleHideButton(
-        interaction,
-        false
-      );
+      case 'room_rename':
+        await handleRenameButton(
+          interaction
+        );
+        return;
 
-    case 'vc_rename':
-      return handleRenameButton(
-        interaction
-      );
+      case 'room_reset':
+        await handleResetButton(
+          interaction
+        );
+        return;
 
-    case 'vc_limit':
-      return handleLimitButton(
-        interaction
-      );
+      case 'room_reset_confirm':
+        await handleResetConfirm(
+          interaction
+        );
+        return;
 
-    case 'vc_invite':
-      return handleInviteButton(
-        interaction
-      );
+      case 'room_reset_cancel':
+        await handleResetCancel(
+          interaction
+        );
+        return;
 
-    case 'vc_transfer':
-      return handleTransferButton(
-        interaction
-      );
+      case 'room_limit':
+        await handleLimitButton(
+          interaction
+        );
+        return;
 
-    case 'vc_deny':
-      return handleDenyButton(
-        interaction
-      );
+      case 'room_invite':
+        await handleInviteMember(
+          interaction
+        );
+        return;
 
-    case 'vc_kick':
-      return handleKickButton(
-        interaction
-      );
+      case 'room_transfer':
+        await handleTransferButton(
+          interaction
+        );
+        return;
 
-    case 'vc_reset':
-      return handleResetButton(
-        interaction
-      );
+      case 'room_deny':
+        await handleDenyMember(
+          interaction
+        );
+        return;
 
-    case 'vc_reset_confirm':
-      return handleResetConfirm(
-        interaction
-      );
+      case 'room_kick':
+        await handleKickMember(
+          interaction
+        );
+        return;
 
-    case 'vc_reset_cancel':
-      return handleResetCancel(
-        interaction
-      );
-
-    default:
-      return;
+      default:
+        return;
+    }
   }
 }
 
 client.on(
   Events.InteractionCreate,
-  async interaction => {
-    try {
-      await handleInteraction(
-        interaction
-      );
-    } catch (error) {
-      logError(
-        'INTERACTION',
-        error,
-        {
-          interactionId:
-            interaction.id,
-
-          guildId:
-            interaction.guildId,
-
-          channelId:
-            interaction.channelId,
-
-          userId:
-            interaction.user?.id,
-
-          customId:
-            interaction.customId,
-
-          commandName:
-            interaction.commandName
-        }
-      );
-
-      const message =
-        error?.message &&
-        String(error.message)
-          .length <= 150
-          ? `❌ ${error.message}`
-          : '❌ Đã xảy ra lỗi khi xử lý thao tác.';
-
-      try {
-        await tempReply(
-          interaction,
-          message,
-          {
-            error: true
-          }
+  interaction => {
+    handleInteraction(
+      interaction
+    ).catch(
+      async error => {
+        logError(
+          'INTERACTION',
+          error
         );
-      } catch {}
-    }
+
+        try {
+          if (
+            interaction.isRepliable()
+          ) {
+            if (
+              interaction.deferred ||
+              interaction.replied
+            ) {
+              await tempFollowUp(
+                interaction,
+                '❌ Đã xảy ra lỗi khi xử lý thao tác. Vui lòng thử lại.',
+                {
+                  error: true
+                }
+              );
+            } else {
+              await tempReply(
+                interaction,
+                '❌ Đã xảy ra lỗi khi xử lý thao tác. Vui lòng thử lại.',
+                {
+                  error: true
+                }
+              );
+            }
+          }
+        } catch {
+        }
+      }
+    );
   }
 );
 
 client.on(
   Events.VoiceStateUpdate,
-  async (
+  (
     oldState,
     newState
   ) => {
-    try {
-      await handleVoiceStateUpdate(
-        oldState,
-        newState
-      );
-    } catch (error) {
-      logError(
-        'VOICE_STATE_UPDATE',
-        error,
-        {
-          guildId:
-            newState.guild?.id ||
-            oldState.guild?.id,
-
-          userId:
-            newState.id ||
-            oldState.id,
-
-          oldChannelId:
-            oldState.channelId,
-
-          newChannelId:
-            newState.channelId
-        }
-      );
-    }
+    handleVoiceStateUpdate(
+      oldState,
+      newState
+    ).catch(
+      error => {
+        logError(
+          'VOICE_STATE_UPDATE',
+          error
+        );
+      }
+    );
   }
 );
 
 client.on(
   Events.MessageCreate,
-  async message => {
-    try {
-      await sendMessageArchive(
-        message
-      );
-    } catch (error) {
-      logError(
-        'MESSAGE_CREATE_LOG',
-        error,
-        {
-          guildId:
-            message.guildId,
-
-          channelId:
-            message.channelId,
-
-          messageId:
-            message.id
-        }
-      );
-    }
+  message => {
+    handleChatMessageCreate(
+      message
+    ).catch(
+      error => {
+        logError(
+          'MESSAGE_CREATE',
+          error
+        );
+      }
+    );
   }
 );
 
 client.on(
   Events.MessageUpdate,
-  async (
+  (
     oldMessage,
     newMessage
   ) => {
-    try {
-      if (newMessage.partial) {
-        await newMessage
-          .fetch()
-          .catch(() => {});
+    handleChatMessageUpdate(
+      oldMessage,
+      newMessage
+    ).catch(
+      error => {
+        logError(
+          'MESSAGE_UPDATE',
+          error
+        );
       }
-
-      await logMessageEdit(
-        oldMessage,
-        newMessage
-      );
-    } catch (error) {
-      logError(
-        'MESSAGE_UPDATE_LOG',
-        error,
-        {
-          guildId:
-            newMessage.guildId,
-
-          channelId:
-            newMessage.channelId,
-
-          messageId:
-            newMessage.id
-        }
-      );
-    }
+    );
   }
 );
 
 client.on(
   Events.MessageDelete,
-  async message => {
-    try {
-      await logMessageDelete(
-        message
-      );
-    } catch (error) {
-      logError(
-        'MESSAGE_DELETE_LOG',
-        error,
-        {
-          guildId:
-            message.guildId,
-
-          channelId:
-            message.channelId,
-
-          messageId:
-            message.id
-        }
-      );
-    }
+  message => {
+    handleChatMessageDelete(
+      message
+    ).catch(
+      error => {
+        logError(
+          'MESSAGE_DELETE',
+          error
+        );
+      }
+    );
   }
 );
 
 client.on(
   Events.ChannelDelete,
-  async channel => {
-    try {
-      if (
-        channel.type ===
-        ChannelType.GuildVoice
-      ) {
-        const room =
-          await getRoom(
-            channel.id
-          );
-
-        if (room) {
-          await deleteRoomRecord(
-            channel.id
-          );
-        }
-      }
-
-      const generator =
-        await getGenerator(
-          channel.guild.id
+  channel => {
+    handleChannelDelete(
+      channel
+    ).catch(
+      error => {
+        logError(
+          'CHANNEL_DELETE_EVENT',
+          error
         );
-
-      if (!generator) {
-        return;
       }
-
-      const updates = [];
-      const values = [];
-      let index = 1;
-
-      if (
-        String(
-          generator.setup_channel_id ||
-          ''
-        ) ===
-        String(channel.id)
-      ) {
-        updates.push(
-          `setup_channel_id=$${index++}`
-        );
-
-        values.push(null);
-
-        updates.push(
-          `setup_message_id=$${index++}`
-        );
-
-        values.push(null);
-      }
-
-      if (
-        String(
-          generator.blog_channel_id ||
-          ''
-        ) ===
-        String(channel.id)
-      ) {
-        updates.push(
-          `blog_channel_id=$${index++}`
-        );
-
-        values.push(null);
-      }
-
-      if (
-        String(
-          generator.tracked_text_channel_id ||
-          ''
-        ) ===
-        String(channel.id)
-      ) {
-        updates.push(
-          `tracked_text_channel_id=$${index++}`
-        );
-
-        values.push(null);
-      }
-
-      if (
-        String(
-          generator.category_id ||
-          ''
-        ) ===
-        String(channel.id)
-      ) {
-        updates.push(
-          `category_id=$${index++}`
-        );
-
-        values.push(null);
-      }
-
-      if (!updates.length) {
-        return;
-      }
-
-      values.push(
-        channel.guild.id
-      );
-
-      await pool.query(
-        `
-          UPDATE generators
-          SET ${updates.join(', ')}
-          WHERE guild_id=$${index}
-        `,
-        values
-      );
-    } catch (error) {
-      logError(
-        'CHANNEL_DELETE',
-        error,
-        {
-          guildId:
-            channel.guild?.id,
-
-          channelId:
-            channel.id
-        }
-      );
-    }
-  }
-);
-
-client.on(
-  Events.GuildDelete,
-  async guild => {
-    try {
-      await pool.query(
-        `
-          DELETE FROM rooms
-          WHERE guild_id=$1
-        `,
-        [guild.id]
-      );
-
-      await pool.query(
-        `
-          DELETE FROM generators
-          WHERE guild_id=$1
-        `,
-        [guild.id]
-      );
-    } catch (error) {
-      logError(
-        'GUILD_DELETE',
-        error,
-        {
-          guildId:
-            guild.id
-        }
-      );
-    }
+    );
   }
 );
 
 client.once(
   Events.ClientReady,
   async readyClient => {
-    console.log(
-      `[DISCORD] ${readyClient.user.tag} đã online.`
-    );
-
     try {
+      console.log(
+        `[${BOT_NAME}] Đã đăng nhập: ${readyClient.user.tag}`
+      );
+
       await registerCommands();
 
       console.log(
-        '[COMMANDS] Slash commands đã sẵn sàng.'
+        `[${BOT_NAME}] Slash Commands đã đăng ký.`
       );
-    } catch (error) {
-      logError(
-        'REGISTER_COMMANDS',
-        error
-      );
-    }
 
-    try {
-      await reconcileRooms();
+      await reconcileAllGuilds();
 
       console.log(
-        '[ROOMS] Đã đồng bộ Temp Voice.'
+        `[${BOT_NAME}] Kiểm tra dữ liệu khởi động hoàn tất.`
       );
     } catch (error) {
       logError(
-        'RECONCILE_ROOMS',
+        'CLIENT_READY',
         error
       );
     }
   }
 );
 
-async function startBot() {
-  try {
-    await initDatabase();
-  } catch (error) {
-    logError(
-      'DATABASE_STARTUP',
-      error
-    );
-
-    try {
-      healthServer.close();
-    } catch {}
-
-    process.exit(1);
-    return;
-  }
-
-  try {
-    await client.login(
-      TOKEN
-    );
-  } catch (error) {
-    logError(
-      'DISCORD_LOGIN',
-      error
-    );
-
-    try {
-      await pool.end();
-    } catch {}
-
-    try {
-      healthServer.close();
-    } catch {}
-
-    process.exit(1);
-  }
-}
-
 async function shutdown(
   signal
 ) {
   console.log(
-    `[SYSTEM] Nhận ${signal}, đang tắt...`
+    `[${BOT_NAME}] Nhận ${signal}, đang tắt an toàn...`
   );
-
-  for (
-    const pending
-    of pendingTransfers.values()
-  ) {
-    if (pending.timer) {
-      clearTimeout(
-        pending.timer
-      );
-    }
-  }
-
-  pendingTransfers.clear();
-  selectedMembers.clear();
-  setupSessions.clear();
-  cooldowns.clear();
-  panelLocks.clear();
 
   try {
     client.destroy();
-  } catch {}
+  } catch (error) {
+    logError(
+      'SHUTDOWN_DISCORD',
+      error
+    );
+  }
 
   try {
     await pool.end();
-  } catch {}
+  } catch (error) {
+    logError(
+      'SHUTDOWN_DATABASE',
+      error
+    );
+  }
 
   try {
     healthServer.close();
-  } catch {}
+  } catch {
+  }
 
-  process.exit(0);
+  process.exit(
+    0
+  );
 }
 
 process.once(
@@ -7088,7 +9467,9 @@ process.once(
           error
         );
 
-        process.exit(1);
+        process.exit(
+          1
+        );
       }
     );
   }
@@ -7106,13 +9487,87 @@ process.once(
           error
         );
 
-        process.exit(1);
+        process.exit(
+          1
+        );
       }
     );
   }
 );
 
-startBot();
+async function start() {
+  await initDatabase();
+
+  await new Promise(
+    (
+      resolve,
+      reject
+    ) => {
+      healthServer.once(
+        'error',
+        reject
+      );
+
+      healthServer.listen(
+        PORT,
+        '0.0.0.0',
+        () => {
+          healthServer.removeListener(
+            'error',
+            reject
+          );
+
+          console.log(
+            `[${BOT_NAME}] Health server: 0.0.0.0:${PORT}`
+          );
+
+          resolve();
+        }
+      );
+    }
+  );
+
+  try {
+    await client.login(
+      TOKEN
+    );
+  } catch (error) {
+    try {
+      healthServer.close();
+    } catch {
+    }
+
+    throw error;
+  }
+}
+
+start().catch(
+  async error => {
+    logError(
+      'STARTUP',
+      error
+    );
+
+    try {
+      client.destroy();
+    } catch {
+    }
+
+    try {
+      await pool.end();
+    } catch {
+    }
+
+    try {
+      healthServer.close();
+    } catch {
+    }
+
+    process.exit(
+      1
+    );
+  }
+);
 
 // UPTIMEROBOT / RENDER FREE
 // URL: https://TEN-SERVICE-CUA-BAN.onrender.com/health
