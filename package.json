@@ -1,0 +1,19 @@
+{
+  "name": "voice-control-bot",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Stable Discord Temp Voice control bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js"
+  },
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "dependencies": {
+    "discord.js": "^14.26.0",
+    "dotenv": "^16.6.1",
+    "pg": "^8.16.3"
+  }
+}
