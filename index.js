@@ -20,15 +20,14 @@ const {
   TextInputStyle,
   PermissionsBitField,
   SlashCommandBuilder,
-  OverwriteType
+  OverwriteType,
+  MessageFlags
 } = require('discord.js');
 
 const { Pool } = require('pg');
 const http = require('http');
 
 const BOT_NAME = 'Voice HDK';
-const BOT_VERSION = '7.0.0';
-
 const TOKEN =
   process.env.DISCORD_TOKEN ||
   process.env.TOKEN;
@@ -55,13 +54,13 @@ const ACTION_LOG_CHANNEL_NAME =
   '⚙️・nhật-ký-chức-năng';
 
 const SUCCESS_DELETE_MS =
-  3000;
+  5000;
 
 const NOTICE_DELETE_MS =
-  4000;
+  5000;
 
 const ERROR_DELETE_MS =
-  4000;
+  5000;
 
 const ACTION_COOLDOWN_MS =
   1500;
@@ -71,6 +70,12 @@ const TRANSFER_TIMEOUT_MS =
 
 const OWNER_ABSENCE_MS =
   10 * 60 * 1000;
+
+const OWNER_ABSENCE_GRACE_MS =
+  OWNER_ABSENCE_MS;
+
+const AUTO_TRANSFER_RETRY_MS =
+  60 * 1000;
 
 const SETUP_TIMEOUT_MS =
   10 * 60 * 1000;
@@ -152,6 +157,11 @@ const emptyRoomTimers =
 
 const ownerAbsenceRuntimeTimers =
   new Map();
+
+// Alias dùng chung cho lớp owner-absence mới và phần runtime cũ.
+// Cùng một Map để tránh hai timer chạy song song cho một phòng.
+const ownerAbsenceTimers =
+  ownerAbsenceRuntimeTimers;
 
 const roomLifecycleLocks =
   new Map();
@@ -314,8 +324,7 @@ const healthServer =
       res.end(
         JSON.stringify({
           ok: true,
-          service: BOT_NAME,
-          version: BOT_VERSION
+          service: BOT_NAME
         })
       );
     }
@@ -624,7 +633,6 @@ async function dropNotNullIfColumnExists(
     `
   );
 }
-
 async function initDatabase() {
   const dbClient =
     await pool.connect();
@@ -1168,6 +1176,16 @@ async function deleteRoomRecord(
   );
 
   await dbClient.query(
+    `DELETE FROM room_presence WHERE channel_id = $1`,
+    [channelId]
+  );
+
+  await dbClient.query(
+    `DELETE FROM owner_absences WHERE channel_id = $1`,
+    [channelId]
+  );
+
+  await dbClient.query(
     `
       DELETE FROM rooms
       WHERE channel_id = $1
@@ -1203,6 +1221,16 @@ async function deleteGuildRoomRecords(
   );
 
   await dbClient.query(
+    `DELETE FROM room_presence WHERE guild_id = $1`,
+    [guildId]
+  );
+
+  await dbClient.query(
+    `DELETE FROM owner_absences WHERE guild_id = $1`,
+    [guildId]
+  );
+
+  await dbClient.query(
     `
       DELETE FROM rooms
       WHERE guild_id = $1
@@ -1212,7 +1240,6 @@ async function deleteGuildRoomRecords(
     ]
   );
 }
-
 async function recordMemberPresence(
   guildId,
   channelId,
@@ -1522,6 +1549,7 @@ async function withRoomLifecycleLock(
     }
   }
 }
+
 function selectedMemberKey(
   guildId,
   channelId,
@@ -2046,7 +2074,6 @@ async function getGuildChannel(
     return null;
   }
 }
-
 async function getGuildRole(
   guild,
   roleId
@@ -2810,7 +2837,6 @@ async function getRoomOwnerMember(
     )
   );
 }
-
 async function getSelectedMember(
   interaction,
   room
@@ -2901,7 +2927,7 @@ async function safeDeferReply(
   }
 
   await interaction.deferReply({
-    ephemeral
+    flags: ephemeral ? MessageFlags.Ephemeral : undefined
   });
 }
 
@@ -2954,7 +2980,7 @@ async function tempReply(
 
   await interaction.reply({
     content,
-    ephemeral: true
+    flags: MessageFlags.Ephemeral
   });
 
   deleteReplyLater(
@@ -2982,7 +3008,7 @@ async function tempFollowUp(
   const message =
     await interaction.followUp({
       content,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
       fetchReply: true
     });
 
@@ -3206,6 +3232,7 @@ async function sendTemporaryChannelNotice(
     return null;
   }
 }
+
 function buildSetupPanel(
   session
 ) {
@@ -3528,7 +3555,6 @@ async function handleSetupCommand(
     );
   }
 }
-
 async function handleSetupNameButton(
   interaction
 ) {
@@ -3869,18 +3895,20 @@ async function safeDeleteManagedChannel(
     );
 
   if (!channel) {
-    return;
+    return true;
   }
 
   try {
     await channel.delete(
       reason
     );
+    return true;
   } catch (error) {
     logError(
       `DELETE_MANAGED_CHANNEL:${channel.id}`,
       error
     );
+    return false;
   }
 }
 
@@ -3896,6 +3924,8 @@ async function cleanupGuildInstallation(
     await getGuildRooms(
       guild.id
     );
+
+  const failedDeletes = [];
 
   for (
     const room
@@ -3918,31 +3948,45 @@ async function cleanupGuildInstallation(
       room.channel_id
     );
 
-    await safeDeleteManagedChannel(
+    if (!(await safeDeleteManagedChannel(
       guild,
       room.channel_id,
       `${BOT_NAME}: cài đặt lại hệ thống`
-    );
+    ))) {
+      failedDeletes.push(String(room.channel_id));
+    }
   }
 
   if (generator) {
-    await safeDeleteManagedChannel(
+    if (!(await safeDeleteManagedChannel(
       guild,
       generator.create_voice_id,
       `${BOT_NAME}: cài đặt lại hệ thống`
-    );
+    ))) {
+      failedDeletes.push(String(generator.create_voice_id));
+    }
 
-    await safeDeleteManagedChannel(
+    if (!(await safeDeleteManagedChannel(
       guild,
       generator.chat_log_channel_id,
       `${BOT_NAME}: cài đặt lại hệ thống`
-    );
+    ))) {
+      failedDeletes.push(String(generator.chat_log_channel_id));
+    }
 
-    await safeDeleteManagedChannel(
+    if (!(await safeDeleteManagedChannel(
       guild,
       generator.action_log_channel_id,
       `${BOT_NAME}: cài đặt lại hệ thống`
-    );
+    ))) {
+      failedDeletes.push(String(generator.action_log_channel_id));
+    }
+  }
+
+  if (failedDeletes.length > 0) {
+    const error = new Error('CLEANUP_CHANNEL_DELETE_FAILED');
+    error.channelIds = failedDeletes;
+    throw error;
   }
 
   const dbClient =
@@ -3956,6 +4000,16 @@ async function cleanupGuildInstallation(
     await deleteGuildRoomRecords(
       guild.id,
       dbClient
+    );
+
+    await dbClient.query(
+      `DELETE FROM room_presence WHERE guild_id = $1`,
+      [guild.id]
+    );
+
+    await dbClient.query(
+      `DELETE FROM owner_absences WHERE guild_id = $1`,
+      [guild.id]
     );
 
     await deleteGenerator(
@@ -4587,7 +4641,9 @@ function buildRoomButtons(
               : '🙈'
           )
           .setStyle(
-            ButtonStyle.Secondary
+            state.hidden
+              ? ButtonStyle.Success
+              : ButtonStyle.Primary
           ),
 
         new ButtonBuilder()
@@ -4601,7 +4657,7 @@ function buildRoomButtons(
             '✏️'
           )
           .setStyle(
-            ButtonStyle.Secondary
+            ButtonStyle.Primary
           )
       );
 
@@ -4633,7 +4689,7 @@ function buildRoomButtons(
             '👥'
           )
           .setStyle(
-            ButtonStyle.Secondary
+            ButtonStyle.Primary
           ),
 
         new ButtonBuilder()
@@ -4647,7 +4703,7 @@ function buildRoomButtons(
             '✉️'
           )
           .setStyle(
-            ButtonStyle.Secondary
+            ButtonStyle.Success
           )
       );
 
@@ -4665,7 +4721,7 @@ function buildRoomButtons(
             '👑'
           )
           .setStyle(
-            ButtonStyle.Secondary
+            ButtonStyle.Primary
           ),
 
         new ButtonBuilder()
@@ -4679,7 +4735,7 @@ function buildRoomButtons(
             '⛔'
           )
           .setStyle(
-            ButtonStyle.Secondary
+            ButtonStyle.Danger
           ),
 
         new ButtonBuilder()
@@ -4693,7 +4749,7 @@ function buildRoomButtons(
             '👢'
           )
           .setStyle(
-            ButtonStyle.Secondary
+            ButtonStyle.Danger
           )
       );
 
@@ -5182,7 +5238,6 @@ async function moveMemberSafe(
     return false;
   }
 }
-
 async function getExistingOwnedChannel(
   guild,
   memberId
@@ -5753,7 +5808,6 @@ async function handleJoinCreateVoice(
     }
   );
 }
-
 async function deleteEmptyRoom(
   channelId
 ) {
@@ -5874,10 +5928,6 @@ async function deleteEmptyRoom(
         }
       }
 
-      await deleteRoomRecord(
-        channel.id
-      );
-
       try {
         await channel.delete(
           `${BOT_NAME}: tự xóa phòng rỗng`
@@ -5887,7 +5937,12 @@ async function deleteEmptyRoom(
           `DELETE_EMPTY_CHANNEL:${channel.id}`,
           error
         );
+        return false;
       }
+
+      await deleteRoomRecord(
+        channel.id
+      );
 
       if (
         typeof sendActionLog ===
@@ -6123,11 +6178,18 @@ async function getRequiredSelectedMember(
     };
   }
 
-  const member =
-    await getGuildMember(
+  let member = null;
+
+  try {
+    member = await interaction.guild.members.fetch(
+      selectedId
+    );
+  } catch {
+    member = await getGuildMember(
       interaction.guild,
       selectedId
     );
+  }
 
   if (!member) {
     clearSelectedMember(
@@ -6135,6 +6197,10 @@ async function getRequiredSelectedMember(
       context.channel.id,
       context.owner.id
     );
+
+    await refreshRoomPanelSafe(
+      context.channel.id
+    ).catch(() => {});
 
     return {
       ok: false,
@@ -6213,6 +6279,10 @@ async function handleRoomMemberSelect(
       context.owner.id
     );
 
+    await refreshRoomPanelSafe(
+      context.channel.id
+    ).catch(() => {});
+
     await tempFollowUp(
       interaction,
       '⚠️ Bạn không cần chọn chính mình.',
@@ -6239,6 +6309,10 @@ async function handleRoomMemberSelect(
       context.channel.id,
       context.owner.id
     );
+
+    await refreshRoomPanelSafe(
+      context.channel.id
+    ).catch(() => {});
 
     await tempFollowUp(
       interaction,
@@ -6307,21 +6381,9 @@ async function handleRoomLock(
         context.channel
       );
 
-    const newLocked =
-      !state.locked;
-
     await setRoomLocked(
       context.channel,
-      newLocked
-    );
-
-    await ensureBotRoomPermissions(
-      context.channel
-    );
-
-    await grantOwnerPermissions(
-      context.channel,
-      context.owner
+      !state.locked
     );
 
     await refreshRoomPanelSafe(
@@ -6330,24 +6392,22 @@ async function handleRoomLock(
 
     await sendActionLog(
       interaction.guild,
-      newLocked
-        ? '🔒'
-        : '🔓',
+      state.locked
+        ? '🔓'
+        : '🔒',
       safeMemberName(
         context.owner
       ),
-      `${
-        newLocked
-          ? 'Khóa'
-          : 'Mở'
-      } phòng ${context.channel.name}`
+      state.locked
+        ? 'Mở phòng'
+        : 'Khóa phòng'
     );
 
     await tempFollowUp(
       interaction,
-      newLocked
-        ? '🔒 Đã khóa phòng.'
-        : '🔓 Đã mở phòng.'
+      state.locked
+        ? '🔓 Đã mở phòng.'
+        : '🔒 Đã khóa phòng.'
     );
   } catch (error) {
     logError(
@@ -6413,21 +6473,9 @@ async function handleRoomHide(
         context.channel
       );
 
-    const newHidden =
-      !state.hidden;
-
     await setRoomHidden(
       context.channel,
-      newHidden
-    );
-
-    await ensureBotRoomPermissions(
-      context.channel
-    );
-
-    await grantOwnerPermissions(
-      context.channel,
-      context.owner
+      !state.hidden
     );
 
     await refreshRoomPanelSafe(
@@ -6436,24 +6484,22 @@ async function handleRoomHide(
 
     await sendActionLog(
       interaction.guild,
-      newHidden
-        ? '🙈'
-        : '👁️',
+      state.hidden
+        ? '👁️'
+        : '🙈',
       safeMemberName(
         context.owner
       ),
-      `${
-        newHidden
-          ? 'Ẩn'
-          : 'Hiện'
-      } phòng ${context.channel.name}`
+      state.hidden
+        ? 'Hiện phòng'
+        : 'Ẩn phòng'
     );
 
     await tempFollowUp(
       interaction,
-      newHidden
-        ? '🙈 Đã ẩn phòng.'
-        : '👁️ Đã hiện phòng.'
+      state.hidden
+        ? '👁️ Đã hiện phòng.'
+        : '🙈 Đã ẩn phòng.'
     );
   } catch (error) {
     logError(
@@ -6463,7 +6509,7 @@ async function handleRoomHide(
 
     await tempFollowUp(
       interaction,
-      '❌ Không thể thay đổi trạng thái hiển thị.',
+      '❌ Không thể thay đổi trạng thái hiển thị phòng.',
       {
         error: true
       }
@@ -6471,7 +6517,7 @@ async function handleRoomHide(
   }
 }
 
-async function handleRoomRenameButton(
+async function handleRoomRename(
   interaction
 ) {
   const context =
@@ -6491,24 +6537,6 @@ async function handleRoomRenameButton(
     return;
   }
 
-  const remaining =
-    useCooldown(
-      'room_rename_open',
-      interaction
-    );
-
-  if (remaining > 0) {
-    await tempReply(
-      interaction,
-      '⏳ Hãy chờ một chút trước khi mở lại biểu mẫu.',
-      {
-        error: true
-      }
-    );
-
-    return;
-  }
-
   const modal =
     new ModalBuilder()
       .setCustomId(
@@ -6518,21 +6546,16 @@ async function handleRoomRenameButton(
         'Đổi tên phòng'
       );
 
-  const currentName =
-    cleanRoomName(
-      context.channel.name
-    );
-
   const input =
     new TextInputBuilder()
       .setCustomId(
-        'room_new_name'
+        'room_name'
       )
       .setLabel(
         'Tên phòng mới'
       )
       .setPlaceholder(
-        'Ví dụ: Gaming'
+        'Nhập tên phòng'
       )
       .setStyle(
         TextInputStyle.Short
@@ -6547,9 +6570,8 @@ async function handleRoomRenameButton(
         80
       )
       .setValue(
-        currentName.slice(
-          0,
-          80
+        cleanRoomName(
+          context.channel.name
         )
       );
 
@@ -6593,14 +6615,13 @@ async function handleRoomRenameModal(
   const remaining =
     useCooldown(
       'room_rename_submit',
-      interaction,
-      3000
+      interaction
     );
 
   if (remaining > 0) {
     await tempReply(
       interaction,
-      '⏳ Bạn vừa đổi tên phòng. Hãy chờ một chút.',
+      '⏳ Thao tác quá nhanh. Hãy thử lại sau một chút.',
       {
         error: true
       }
@@ -6609,14 +6630,18 @@ async function handleRoomRenameModal(
     return;
   }
 
-  const requested =
+  const rawName =
+    interaction.fields
+      .getTextInputValue(
+        'room_name'
+      );
+
+  const name =
     cleanRoomName(
-      interaction.fields.getTextInputValue(
-        'room_new_name'
-      )
+      rawName
     );
 
-  if (!requested) {
+  if (!name) {
     await tempReply(
       interaction,
       '❌ Tên phòng không hợp lệ.',
@@ -6628,19 +6653,14 @@ async function handleRoomRenameModal(
     return;
   }
 
-  const newName =
-    `${ROOM_PREFIX}${requested}`;
-
   try {
-    if (
-      context.channel.name !==
-      newName
-    ) {
-      await context.channel.setName(
-        newName,
-        `${BOT_NAME}: chủ phòng đổi tên`
-      );
-    }
+    const fullName =
+      `${ROOM_PREFIX}${name}`;
+
+    await context.channel.setName(
+      fullName,
+      `${BOT_NAME}: chủ phòng đổi tên`
+    );
 
     await refreshRoomPanelSafe(
       context.channel.id
@@ -6652,12 +6672,12 @@ async function handleRoomRenameModal(
       safeMemberName(
         context.owner
       ),
-      `Đổi tên phòng thành ${newName}`
+      `Đổi tên phòng thành ${fullName}`
     );
 
     await tempReply(
       interaction,
-      `✅ Đã đổi tên phòng thành ${newName}`
+      `✏️ Đã đổi tên phòng thành **${name}**.`
     );
   } catch (error) {
     logError(
@@ -6675,7 +6695,98 @@ async function handleRoomRenameModal(
   }
 }
 
-async function handleRoomLimitButton(
+async function handleRoomReset(
+  interaction
+) {
+  await safeDeferUpdate(
+    interaction
+  );
+
+  const remaining =
+    useCooldown(
+      'room_reset',
+      interaction
+    );
+
+  if (remaining > 0) {
+    await tempFollowUp(
+      interaction,
+      '⏳ Thao tác quá nhanh. Hãy thử lại sau một chút.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  const context =
+    await getOwnerRoomContext(
+      interaction
+    );
+
+  if (!context.ok) {
+    await tempFollowUp(
+      interaction,
+      context.message,
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
+  try {
+    clearSelectedMember(
+      interaction.guild.id,
+      context.channel.id,
+      context.owner.id
+    );
+
+    clearPendingTransfer(
+      context.channel.id
+    );
+
+    await resetRoomState(
+      context.channel,
+      context.owner.id
+    );
+
+    await refreshRoomPanelSafe(
+      context.channel.id
+    );
+
+    await sendActionLog(
+      interaction.guild,
+      '♻️',
+      safeMemberName(
+        context.owner
+      ),
+      'Đặt lại phòng'
+    );
+
+    await tempFollowUp(
+      interaction,
+      '♻️ Đã đặt lại phòng.'
+    );
+  } catch (error) {
+    logError(
+      'ROOM_RESET',
+      error
+    );
+
+    await tempFollowUp(
+      interaction,
+      '❌ Không thể đặt lại phòng.',
+      {
+        error: true
+      }
+    );
+  }
+}
+
+async function handleRoomLimit(
   interaction
 ) {
   const context =
@@ -6713,7 +6824,7 @@ async function handleRoomLimitButton(
         'Số người tối đa (0 = không giới hạn)'
       )
       .setPlaceholder(
-        'Ví dụ: 5'
+        '0 - 99'
       )
       .setStyle(
         TextInputStyle.Short
@@ -6875,7 +6986,6 @@ async function handleRoomLimitModal(
     );
   }
 }
-
 async function handleRoomInvite(
   interaction
 ) {
@@ -6931,6 +7041,10 @@ async function handleRoomInvite(
       interaction.guild.id,
       context.channel.id,
       context.owner.id
+    );
+
+    await refreshRoomPanelSafe(
+      context.channel.id
     );
 
     await sendActionLog(
@@ -7010,6 +7124,29 @@ async function handleRoomDeny(
 
   const member =
     selected.member;
+
+  if (
+    member.voice?.channelId !==
+    context.channel.id
+  ) {
+    clearSelectedMember(
+      interaction.guild.id,
+      context.channel.id,
+      context.owner.id
+    );
+
+    await refreshRoomPanelSafe(
+      context.channel.id
+    ).catch(() => {});
+
+    await tempFollowUp(
+      interaction,
+      `⚠️ ${safeMemberName(member)} không có mặt trong phòng này.`,
+      { error: true }
+    );
+
+    return;
+  }
 
   try {
     await denyMemberFromRoom(
@@ -7122,9 +7259,13 @@ async function handleRoomKick(
       context.owner.id
     );
 
+    await refreshRoomPanelSafe(
+      context.channel.id
+    ).catch(() => {});
+
     await tempFollowUp(
       interaction,
-      '❌ Thành viên đã chọn không còn ở trong phòng.',
+      `⚠️ ${safeMemberName(member)} không có mặt trong phòng này.`,
       {
         error: true
       }
@@ -7188,7 +7329,6 @@ async function handleRoomKick(
     );
   }
 }
-
 function buildResetConfirmation() {
   const embed =
     new EmbedBuilder()
@@ -7273,7 +7413,7 @@ async function handleRoomResetButton(
 
   await interaction.reply({
     ...buildResetConfirmation(),
-    ephemeral: true
+    flags: MessageFlags.Ephemeral
   });
 }
 
@@ -7636,9 +7776,13 @@ async function handleRoomTransferButton(
       context.owner.id
     );
 
+    await refreshRoomPanelSafe(
+      context.channel.id
+    ).catch(() => {});
+
     await tempFollowUp(
       interaction,
-      '❌ Người nhận quyền chủ phải đang ở trong phòng.',
+      `⚠️ ${safeMemberName(target)} không có mặt trong phòng này.`,
       {
         error: true
       }
@@ -7702,6 +7846,10 @@ async function handleRoomTransferButton(
       context,
       target
     );
+
+    await refreshRoomPanelSafe(
+      context.channel.id
+    );
   } catch (error) {
     logError(
       'ROOM_TRANSFER_REQUEST',
@@ -7717,6 +7865,7 @@ async function handleRoomTransferButton(
     );
   }
 }
+
 function actionActorName(
   actor
 ) {
@@ -7838,7 +7987,6 @@ async function sendActionLog(
     return null;
   }
 }
-
 function buildTransferRequestPayload({
   owner,
   target,
@@ -7980,7 +8128,7 @@ async function expireTransferRequest(
 
   await editTransferResult(
     message,
-    '⌛ Yêu cầu chuyển chủ đã hết hạn.',
+    '⚠️ Chuyển chủ thất bại: người được chọn không phản hồi trong 60 giây.',
     SUCCESS_DELETE_MS
   );
 }
@@ -8546,7 +8694,6 @@ async function handleTransferDecline(
     SUCCESS_DELETE_MS
   );
 }
-
 function compactLogText(
   value,
   maxLength =
@@ -10212,7 +10359,6 @@ async function applyAutomaticOwnershipTransfer(
     NOTICE_DELETE_MS
   );
 }
-
 async function processOwnerAbsenceExpiry(
   channelId
 ) {
@@ -10598,6 +10744,14 @@ const slashCommands = [
     )
     .setDescription(
       'Kiểm tra trạng thái hệ thống Voice HDK'
+    ),
+
+  new SlashCommandBuilder()
+    .setName(
+      'reset'
+    )
+    .setDescription(
+      'Xóa sạch dữ liệu và tài nguyên Voice HDK của server này'
     )
 ].map(
   command =>
@@ -10726,7 +10880,6 @@ async function handlePanelCommand(
     );
   }
 }
-
 async function handleClaimCommand(
   interaction
 ) {
@@ -11099,7 +11252,6 @@ async function handleClaimCommand(
     );
   }
 }
-
 function doctorLine(
   ok,
   label,
@@ -11381,7 +11533,7 @@ async function handleDoctorCommand(
       )
       .setFooter({
         text:
-          `${BOT_NAME} • v${BOT_VERSION}`
+          BOT_NAME
       });
 
   await interaction.editReply({
@@ -11391,51 +11543,6 @@ async function handleDoctorCommand(
     components: []
   });
 }
-
-async function recreateMissingGeneratorVoice(
-  guild,
-  generator
-) {
-  const category =
-    await getGuildChannel(
-      guild,
-      String(
-        generator.button_category_id ||
-        ''
-      )
-    );
-
-  if (
-    !category ||
-    category.type !==
-      ChannelType.GuildCategory
-  ) {
-    return null;
-  }
-
-  const channel =
-    await createGeneratorVoiceChannel(
-      guild,
-      category
-    );
-
-  await pool.query(
-    `
-      UPDATE generators
-      SET
-        create_voice_id = $2,
-        updated_at = NOW()
-      WHERE guild_id = $1
-    `,
-    [
-      guild.id,
-      channel.id
-    ]
-  );
-
-  return channel;
-}
-
 async function reconcileGeneratorVoice(
   guild,
   generator
@@ -11454,13 +11561,18 @@ async function reconcileGeneratorVoice(
     createVoice.type !==
       ChannelType.GuildVoice
   ) {
-    createVoice =
-      await recreateMissingGeneratorVoice(
-        guild,
-        generator
-      );
+    await pool.query(
+      `
+        UPDATE generators
+        SET
+          create_voice_id = NULL,
+          updated_at = NOW()
+        WHERE guild_id = $1
+      `,
+      [guild.id]
+    );
 
-    return createVoice;
+    return null;
   }
 
   const category =
@@ -11738,7 +11850,6 @@ async function reconcileGuild(
     guild
   );
 }
-
 async function reconcileAllGuilds() {
   for (
     const guild
@@ -11755,6 +11866,116 @@ async function reconcileAllGuilds() {
       );
     }
   }
+}
+
+async function handleSystemResetCommand(
+  interaction
+) {
+  await safeDeferReply(
+    interaction,
+    true
+  );
+
+  if (
+    !interaction.guild ||
+    !canManageSetup(interaction)
+  ) {
+    await tempReply(
+      interaction,
+      '❌ Bạn cần quyền Quản lý máy chủ để dùng /reset.',
+      { error: true }
+    );
+    return;
+  }
+
+  const row =
+    new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId('system_reset_confirm')
+          .setLabel('Xác nhận reset')
+          .setEmoji('🗑️')
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId('system_reset_cancel')
+          .setLabel('Hủy')
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+  await interaction.editReply({
+    content: [
+      '⚠️ **RESET VOICE HDK**',
+      'Thao tác này xóa các phòng, generator, kênh log và dữ liệu Voice HDK của server này.',
+      'Category Discord và các kênh không thuộc Voice HDK sẽ được giữ nguyên.'
+    ].join('\n'),
+    components: [row]
+  });
+}
+
+async function handleSystemResetConfirm(
+  interaction
+) {
+  await safeDeferUpdate(interaction);
+
+  if (
+    !interaction.guild ||
+    !canManageSetup(interaction)
+  ) {
+    await interaction.editReply({
+      content: '❌ Bạn không có quyền reset Voice HDK.',
+      components: [],
+      embeds: []
+    });
+    deleteReplyLater(interaction, ERROR_DELETE_MS);
+    return;
+  }
+
+  try {
+    await cleanupGuildInstallation(
+      interaction.guild
+    );
+
+    for (const [key, value] of setupSessions.entries()) {
+      if (key.startsWith(`${interaction.guild.id}:`)) {
+        if (value?.timer) clearTimeout(value.timer);
+        setupSessions.delete(key);
+      }
+    }
+
+    for (const [key, value] of selectedMembers.entries()) {
+      if (key.startsWith(`${interaction.guild.id}:`)) {
+        if (value?.timer) clearTimeout(value.timer);
+        selectedMembers.delete(key);
+      }
+    }
+
+    await interaction.editReply({
+      content: '✅ Đã reset sạch Voice HDK của server này. Dùng `/setup` để cài lại.',
+      components: [],
+      embeds: []
+    });
+    deleteReplyLater(interaction, SUCCESS_DELETE_MS);
+  } catch (error) {
+    logError('SYSTEM_RESET', error);
+    await interaction.editReply({
+      content: '❌ Reset chưa hoàn tất. Bot đã giữ dữ liệu còn lại để tránh mất dấu tài nguyên.',
+      components: [],
+      embeds: []
+    });
+    deleteReplyLater(interaction, ERROR_DELETE_MS);
+  }
+}
+
+async function handleSystemResetCancel(
+  interaction
+) {
+  await safeDeferUpdate(interaction);
+  await interaction.editReply({
+    content: '✖️ Đã hủy reset Voice HDK.',
+    components: [],
+    embeds: []
+  });
+  deleteReplyLater(interaction, SUCCESS_DELETE_MS);
 }
 
 async function routeButtonInteraction(
@@ -11865,6 +12086,18 @@ async function routeButtonInteraction(
       );
       return;
 
+    case 'system_reset_confirm':
+      await handleSystemResetConfirm(
+        interaction
+      );
+      return;
+
+    case 'system_reset_cancel':
+      await handleSystemResetCancel(
+        interaction
+      );
+      return;
+
     default:
       return;
   }
@@ -11923,7 +12156,6 @@ async function routeSelectInteraction(
     );
   }
 }
-
 async function routeModalInteraction(
   interaction
 ) {
@@ -11979,6 +12211,12 @@ async function routeChatCommand(
 
     case 'doctor':
       await handleDoctorCommand(
+        interaction
+      );
+      return;
+
+    case 'reset':
+      await handleSystemResetCommand(
         interaction
       );
       return;
@@ -12051,7 +12289,7 @@ client.on(
           await interaction.reply({
             content:
               '❌ Đã xảy ra lỗi khi xử lý thao tác.',
-            ephemeral: true
+            flags: MessageFlags.Ephemeral
           });
 
           deleteReplyLater(
@@ -12126,7 +12364,6 @@ client.on(
     }
   }
 );
-
 client.on(
   Events.MessageCreate,
   async message => {
@@ -12272,25 +12509,6 @@ client.on(
           ]
         );
 
-        const timer =
-          setTimeout(
-            () => {
-              reconcileGuild(
-                channel.guild
-              ).catch(
-                error => {
-                  logError(
-                    `RECREATE_GENERATOR:${channel.guild.id}`,
-                    error
-                  );
-                }
-              );
-            },
-            1500
-          );
-
-        timer.unref?.();
-
         return;
       }
 
@@ -12425,7 +12643,6 @@ client.on(
     }
   }
 );
-
 client.once(
   Events.ClientReady,
   async readyClient => {
@@ -12439,7 +12656,7 @@ client.once(
       await reconcileAllGuilds();
 
       console.log(
-        `[READY] ${BOT_NAME} v${BOT_VERSION} đã sẵn sàng.`
+        `[READY] ${BOT_NAME} đã sẵn sàng.`
       );
     } catch (error) {
       logError(
@@ -12572,7 +12789,7 @@ process.once(
 
 async function startBot() {
   console.log(
-    `[START] ${BOT_NAME} v${BOT_VERSION}`
+    `[START] ${BOT_NAME}`
   );
 
   await initDatabase();
