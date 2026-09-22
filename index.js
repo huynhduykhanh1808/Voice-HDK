@@ -1240,6 +1240,7 @@ async function deleteGuildRoomRecords(
     ]
   );
 }
+
 async function recordMemberPresence(
   guildId,
   channelId,
@@ -1504,7 +1505,6 @@ function clearRuntimeOwnerAbsenceTimer(
     );
   }
 }
-
 async function withRoomLifecycleLock(
   channelId,
   task
@@ -2600,7 +2600,8 @@ async function setRoomHidden(
 
 async function inviteMemberToRoom(
   channel,
-  member
+  member,
+  inviter = null
 ) {
   if (
     !member ||
@@ -2623,6 +2624,43 @@ async function inviteMemberToRoom(
     },
     `${BOT_NAME}: mời thành viên`
   );
+
+  const inviteUrl =
+    `https://discord.com/channels/${channel.guild.id}/${channel.id}`;
+
+  const row =
+    new ActionRowBuilder()
+      .addComponents(
+        new ButtonBuilder()
+          .setLabel('Tham gia phòng')
+          .setEmoji('🔊')
+          .setStyle(ButtonStyle.Link)
+          .setURL(inviteUrl)
+      );
+
+  let dmSent = false;
+
+  try {
+    await member.send({
+      content: [
+        `✉️ **${safeMemberName(inviter)} đã mời bạn tham gia phòng thoại.**`,
+        `🔊 **${channel.name}**`,
+        `🏠 Server: **${channel.guild.name}**`,
+        '',
+        'Bạn đã được cấp quyền **xem phòng** và **kết nối**.'
+      ].join('\n'),
+      components: [row]
+    });
+
+    dmSent = true;
+  } catch {
+    dmSent = false;
+  }
+
+  return {
+    dmSent,
+    inviteUrl
+  };
 }
 
 async function denyMemberFromRoom(
@@ -2837,6 +2875,7 @@ async function getRoomOwnerMember(
     )
   );
 }
+
 async function getSelectedMember(
   interaction,
   room
@@ -2878,7 +2917,6 @@ function deleteReplyLater(
 
   timer.unref?.();
 }
-
 function deleteMessageLater(
   message,
   delay =
@@ -2979,8 +3017,7 @@ async function tempReply(
   }
 
   await interaction.reply({
-    content,
-    flags: MessageFlags.Ephemeral
+    content
   });
 
   deleteReplyLater(
@@ -3008,7 +3045,6 @@ async function tempFollowUp(
   const message =
     await interaction.followUp({
       content,
-      flags: MessageFlags.Ephemeral,
       fetchReply: true
     });
 
@@ -3398,6 +3434,19 @@ function buildReinstallPanel() {
           ),
         new ButtonBuilder()
           .setCustomId(
+            'setup_uninstall'
+          )
+          .setLabel(
+            'Gỡ cài đặt'
+          )
+          .setEmoji(
+            '🗑️'
+          )
+          .setStyle(
+            ButtonStyle.Danger
+          ),
+        new ButtonBuilder()
+          .setCustomId(
             'setup_reinstall_cancel'
           )
           .setLabel(
@@ -3459,7 +3508,6 @@ function buildSetupSuccessPanel(
     components: []
   };
 }
-
 async function handleSetupCommand(
   interaction
 ) {
@@ -3555,6 +3603,7 @@ async function handleSetupCommand(
     );
   }
 }
+
 async function handleSetupNameButton(
   interaction
 ) {
@@ -3880,7 +3929,6 @@ async function handleSetupCategorySelect(
     )
   );
 }
-
 async function safeDeleteManagedChannel(
   guild,
   channelId,
@@ -4117,6 +4165,64 @@ async function handleReinstallConfirm(
       {
         error: true
       }
+    );
+  }
+}
+
+async function handleSetupUninstall(
+  interaction
+) {
+  await safeDeferUpdate(
+    interaction
+  );
+
+  if (
+    !interaction.guild ||
+    !canManageSetup(interaction)
+  ) {
+    await tempFollowUp(
+      interaction,
+      '❌ Bạn không có quyền gỡ cài đặt Voice HDK.',
+      { error: true }
+    );
+    return;
+  }
+
+  try {
+    await cleanupGuildInstallation(
+      interaction.guild
+    );
+
+    for (const [key, value] of setupSessions.entries()) {
+      if (key.startsWith(`${interaction.guild.id}:`)) {
+        if (value?.timer) clearTimeout(value.timer);
+        setupSessions.delete(key);
+      }
+    }
+
+    for (const [key, value] of selectedMembers.entries()) {
+      if (key.startsWith(`${interaction.guild.id}:`)) {
+        if (value?.timer) clearTimeout(value.timer);
+        selectedMembers.delete(key);
+      }
+    }
+
+    await interaction.editReply({
+      content: '✅ Đã gỡ cài đặt Voice HDK khỏi server này và xóa dữ liệu Voice HDK của server khỏi Neon.',
+      embeds: [],
+      components: []
+    });
+
+    deleteReplyLater(
+      interaction,
+      SUCCESS_DELETE_MS
+    );
+  } catch (error) {
+    logError('SETUP_UNINSTALL', error);
+    await tempFollowUp(
+      interaction,
+      '❌ Gỡ cài đặt chưa hoàn tất. Bot giữ lại dữ liệu theo dõi nếu có kênh quản lý không xóa được để tránh dữ liệu mồ côi.',
+      { error: true }
     );
   }
 }
@@ -4511,6 +4617,7 @@ async function handleSetupInstall(
     );
   }
 }
+
 function humanMembers(
   channel
 ) {
@@ -5238,6 +5345,7 @@ async function moveMemberSafe(
     return false;
   }
 }
+
 async function getExistingOwnedChannel(
   guild,
   memberId
@@ -5341,7 +5449,7 @@ async function createPersonalVoiceRoom(
   }
 
   const roomName =
-    `${ROOM_PREFIX}${cleanRoomName(
+    `${ROOM_PREFIX}Phòng của ${cleanRoomName(
       safeMemberName(
         member
       )
@@ -5584,7 +5692,6 @@ async function recordVoiceLeaveIfManaged(
     memberId
   );
 }
-
 async function handleJoinCreateVoice(
   voiceState
 ) {
@@ -5808,6 +5915,7 @@ async function handleJoinCreateVoice(
     }
   );
 }
+
 async function deleteEmptyRoom(
   channelId
 ) {
@@ -5937,6 +6045,7 @@ async function deleteEmptyRoom(
           `DELETE_EMPTY_CHANNEL:${channel.id}`,
           error
         );
+
         return false;
       }
 
@@ -6181,14 +6290,16 @@ async function getRequiredSelectedMember(
   let member = null;
 
   try {
-    member = await interaction.guild.members.fetch(
-      selectedId
-    );
+    member =
+      await interaction.guild.members.fetch(
+        selectedId
+      );
   } catch {
-    member = await getGuildMember(
-      interaction.guild,
-      selectedId
-    );
+    member =
+      await getGuildMember(
+        interaction.guild,
+        selectedId
+      );
   }
 
   if (!member) {
@@ -6200,7 +6311,9 @@ async function getRequiredSelectedMember(
 
     await refreshRoomPanelSafe(
       context.channel.id
-    ).catch(() => {});
+    ).catch(
+      () => {}
+    );
 
     return {
       ok: false,
@@ -6224,6 +6337,7 @@ async function getRequiredSelectedMember(
     member
   };
 }
+
 async function handleRoomMemberSelect(
   interaction
 ) {
@@ -6281,7 +6395,9 @@ async function handleRoomMemberSelect(
 
     await refreshRoomPanelSafe(
       context.channel.id
-    ).catch(() => {});
+    ).catch(
+      () => {}
+    );
 
     await tempFollowUp(
       interaction,
@@ -6312,7 +6428,9 @@ async function handleRoomMemberSelect(
 
     await refreshRoomPanelSafe(
       context.channel.id
-    ).catch(() => {});
+    ).catch(
+      () => {}
+    );
 
     await tempFollowUp(
       interaction,
@@ -6381,9 +6499,21 @@ async function handleRoomLock(
         context.channel
       );
 
+    const newLocked =
+      !state.locked;
+
     await setRoomLocked(
       context.channel,
-      !state.locked
+      newLocked
+    );
+
+    await ensureBotRoomPermissions(
+      context.channel
+    );
+
+    await grantOwnerPermissions(
+      context.channel,
+      context.owner
     );
 
     await refreshRoomPanelSafe(
@@ -6392,22 +6522,24 @@ async function handleRoomLock(
 
     await sendActionLog(
       interaction.guild,
-      state.locked
-        ? '🔓'
-        : '🔒',
+      newLocked
+        ? '🔒'
+        : '🔓',
       safeMemberName(
         context.owner
       ),
-      state.locked
-        ? 'Mở phòng'
-        : 'Khóa phòng'
+      `${
+        newLocked
+          ? 'Khóa'
+          : 'Mở'
+      } phòng ${context.channel.name}`
     );
 
     await tempFollowUp(
       interaction,
-      state.locked
-        ? '🔓 Đã mở phòng.'
-        : '🔒 Đã khóa phòng.'
+      newLocked
+        ? '🔒 Đã khóa phòng.'
+        : '🔓 Đã mở phòng.'
     );
   } catch (error) {
     logError(
@@ -6473,9 +6605,21 @@ async function handleRoomHide(
         context.channel
       );
 
+    const newHidden =
+      !state.hidden;
+
     await setRoomHidden(
       context.channel,
-      !state.hidden
+      newHidden
+    );
+
+    await ensureBotRoomPermissions(
+      context.channel
+    );
+
+    await grantOwnerPermissions(
+      context.channel,
+      context.owner
     );
 
     await refreshRoomPanelSafe(
@@ -6484,22 +6628,24 @@ async function handleRoomHide(
 
     await sendActionLog(
       interaction.guild,
-      state.hidden
-        ? '👁️'
-        : '🙈',
+      newHidden
+        ? '🙈'
+        : '👁️',
       safeMemberName(
         context.owner
       ),
-      state.hidden
-        ? 'Hiện phòng'
-        : 'Ẩn phòng'
+      `${
+        newHidden
+          ? 'Ẩn'
+          : 'Hiện'
+      } phòng ${context.channel.name}`
     );
 
     await tempFollowUp(
       interaction,
-      state.hidden
-        ? '👁️ Đã hiện phòng.'
-        : '🙈 Đã ẩn phòng.'
+      newHidden
+        ? '🙈 Đã ẩn phòng.'
+        : '👁️ Đã hiện phòng.'
     );
   } catch (error) {
     logError(
@@ -6509,15 +6655,14 @@ async function handleRoomHide(
 
     await tempFollowUp(
       interaction,
-      '❌ Không thể thay đổi trạng thái hiển thị phòng.',
+      '❌ Không thể thay đổi trạng thái hiển thị.',
       {
         error: true
       }
     );
   }
 }
-
-async function handleRoomRename(
+async function handleRoomRenameButton(
   interaction
 ) {
   const context =
@@ -6537,6 +6682,24 @@ async function handleRoomRename(
     return;
   }
 
+  const remaining =
+    useCooldown(
+      'room_rename_open',
+      interaction
+    );
+
+  if (remaining > 0) {
+    await tempReply(
+      interaction,
+      '⏳ Hãy chờ một chút trước khi mở lại biểu mẫu.',
+      {
+        error: true
+      }
+    );
+
+    return;
+  }
+
   const modal =
     new ModalBuilder()
       .setCustomId(
@@ -6546,16 +6709,21 @@ async function handleRoomRename(
         'Đổi tên phòng'
       );
 
+  const currentName =
+    cleanRoomName(
+      context.channel.name
+    );
+
   const input =
     new TextInputBuilder()
       .setCustomId(
-        'room_name'
+        'room_new_name'
       )
       .setLabel(
         'Tên phòng mới'
       )
       .setPlaceholder(
-        'Nhập tên phòng'
+        'Ví dụ: Gaming'
       )
       .setStyle(
         TextInputStyle.Short
@@ -6570,8 +6738,9 @@ async function handleRoomRename(
         80
       )
       .setValue(
-        cleanRoomName(
-          context.channel.name
+        currentName.slice(
+          0,
+          80
         )
       );
 
@@ -6592,7 +6761,7 @@ async function handleRoomRenameModal(
 ) {
   await safeDeferReply(
     interaction,
-    true
+    false
   );
 
   const context =
@@ -6615,13 +6784,14 @@ async function handleRoomRenameModal(
   const remaining =
     useCooldown(
       'room_rename_submit',
-      interaction
+      interaction,
+      3000
     );
 
   if (remaining > 0) {
     await tempReply(
       interaction,
-      '⏳ Thao tác quá nhanh. Hãy thử lại sau một chút.',
+      '⏳ Bạn vừa đổi tên phòng. Hãy chờ một chút.',
       {
         error: true
       }
@@ -6630,18 +6800,14 @@ async function handleRoomRenameModal(
     return;
   }
 
-  const rawName =
-    interaction.fields
-      .getTextInputValue(
-        'room_name'
-      );
-
-  const name =
+  const requested =
     cleanRoomName(
-      rawName
+      interaction.fields.getTextInputValue(
+        'room_new_name'
+      )
     );
 
-  if (!name) {
+  if (!requested) {
     await tempReply(
       interaction,
       '❌ Tên phòng không hợp lệ.',
@@ -6653,14 +6819,19 @@ async function handleRoomRenameModal(
     return;
   }
 
-  try {
-    const fullName =
-      `${ROOM_PREFIX}${name}`;
+  const newName =
+    `${ROOM_PREFIX}${requested}`;
 
-    await context.channel.setName(
-      fullName,
-      `${BOT_NAME}: chủ phòng đổi tên`
-    );
+  try {
+    if (
+      context.channel.name !==
+      newName
+    ) {
+      await context.channel.setName(
+        newName,
+        `${BOT_NAME}: chủ phòng đổi tên`
+      );
+    }
 
     await refreshRoomPanelSafe(
       context.channel.id
@@ -6672,12 +6843,12 @@ async function handleRoomRenameModal(
       safeMemberName(
         context.owner
       ),
-      `Đổi tên phòng thành ${fullName}`
+      `Đổi tên phòng thành ${newName}`
     );
 
     await tempReply(
       interaction,
-      `✏️ Đã đổi tên phòng thành **${name}**.`
+      `✅ Đã đổi tên phòng thành ${newName}`
     );
   } catch (error) {
     logError(
@@ -6695,98 +6866,7 @@ async function handleRoomRenameModal(
   }
 }
 
-async function handleRoomReset(
-  interaction
-) {
-  await safeDeferUpdate(
-    interaction
-  );
-
-  const remaining =
-    useCooldown(
-      'room_reset',
-      interaction
-    );
-
-  if (remaining > 0) {
-    await tempFollowUp(
-      interaction,
-      '⏳ Thao tác quá nhanh. Hãy thử lại sau một chút.',
-      {
-        error: true
-      }
-    );
-
-    return;
-  }
-
-  const context =
-    await getOwnerRoomContext(
-      interaction
-    );
-
-  if (!context.ok) {
-    await tempFollowUp(
-      interaction,
-      context.message,
-      {
-        error: true
-      }
-    );
-
-    return;
-  }
-
-  try {
-    clearSelectedMember(
-      interaction.guild.id,
-      context.channel.id,
-      context.owner.id
-    );
-
-    clearPendingTransfer(
-      context.channel.id
-    );
-
-    await resetRoomState(
-      context.channel,
-      context.owner.id
-    );
-
-    await refreshRoomPanelSafe(
-      context.channel.id
-    );
-
-    await sendActionLog(
-      interaction.guild,
-      '♻️',
-      safeMemberName(
-        context.owner
-      ),
-      'Đặt lại phòng'
-    );
-
-    await tempFollowUp(
-      interaction,
-      '♻️ Đã đặt lại phòng.'
-    );
-  } catch (error) {
-    logError(
-      'ROOM_RESET',
-      error
-    );
-
-    await tempFollowUp(
-      interaction,
-      '❌ Không thể đặt lại phòng.',
-      {
-        error: true
-      }
-    );
-  }
-}
-
-async function handleRoomLimit(
+async function handleRoomLimitButton(
   interaction
 ) {
   const context =
@@ -6824,7 +6904,7 @@ async function handleRoomLimit(
         'Số người tối đa (0 = không giới hạn)'
       )
       .setPlaceholder(
-        '0 - 99'
+        'Ví dụ: 5'
       )
       .setStyle(
         TextInputStyle.Short
@@ -6862,7 +6942,7 @@ async function handleRoomLimitModal(
 ) {
   await safeDeferReply(
     interaction,
-    true
+    false
   );
 
   const context =
@@ -6986,6 +7066,7 @@ async function handleRoomLimitModal(
     );
   }
 }
+
 async function handleRoomInvite(
   interaction
 ) {
@@ -7032,10 +7113,12 @@ async function handleRoomInvite(
     selected.member;
 
   try {
-    await inviteMemberToRoom(
-      context.channel,
-      member
-    );
+    const inviteResult =
+      await inviteMemberToRoom(
+        context.channel,
+        member,
+        context.owner
+      );
 
     clearSelectedMember(
       interaction.guild.id,
@@ -7060,9 +7143,9 @@ async function handleRoomInvite(
 
     await tempFollowUp(
       interaction,
-      `✉️ Đã cấp quyền vào phòng cho ${safeMemberName(
-        member
-      )}.`
+      inviteResult.dmSent
+        ? `✉️ <@${context.owner.id}> đã mời <@${member.id}> vào **${context.channel.name}**. Lời mời đã được gửi qua DM và quyền xem/kết nối đã được cấp.`
+        : `✉️ <@${context.owner.id}> đã mời <@${member.id}> vào **${context.channel.name}** và đã cấp quyền xem/kết nối, nhưng không thể gửi DM cho thành viên này.`
     );
   } catch (error) {
     logError(
@@ -7329,6 +7412,7 @@ async function handleRoomKick(
     );
   }
 }
+
 function buildResetConfirmation() {
   const embed =
     new EmbedBuilder()
@@ -7412,8 +7496,7 @@ async function handleRoomResetButton(
   }
 
   await interaction.reply({
-    ...buildResetConfirmation(),
-    flags: MessageFlags.Ephemeral
+    ...buildResetConfirmation()
   });
 }
 
@@ -7720,7 +7803,6 @@ async function handleRoomRegionSelect(
     );
   }
 }
-
 async function handleRoomTransferButton(
   interaction
 ) {
@@ -7987,6 +8069,7 @@ async function sendActionLog(
     return null;
   }
 }
+
 function buildTransferRequestPayload({
   owner,
   target,
@@ -8366,25 +8449,25 @@ async function handleTransferAccept(
         }
 
         if (
-          !oldOwner ||
+          oldOwner &&
           oldOwner.voice?.channelId !==
-          channel.id
+            channel.id
         ) {
           throw new Error(
             'TRANSFER_OWNER_LEFT'
           );
         }
 
-        const ownedRoom =
+        const targetOwnedRoom =
           await getOwnedRoom(
             guild.id,
             newOwner.id
           );
 
         if (
-          ownedRoom &&
+          targetOwnedRoom &&
           String(
-            ownedRoom.channel_id
+            targetOwnedRoom.channel_id
           ) !==
           channel.id
         ) {
@@ -8393,140 +8476,44 @@ async function handleTransferAccept(
           );
         }
 
-        const dbClient =
-          await pool.connect();
+        await transferRoomOwner(
+          channel.id,
+          newOwner.id
+        );
 
         try {
-          await dbClient.query(
-            'BEGIN'
-          );
-
-          const locked =
-            await dbClient.query(
-              `
-                SELECT *
-                FROM rooms
-                WHERE channel_id = $1
-                FOR UPDATE
-              `,
-              [
-                channel.id
-              ]
-            );
-
-          const lockedRoom =
-            locked.rows[0];
-
-          if (!lockedRoom) {
-            throw new Error(
-              'TRANSFER_ROOM_MISSING'
+          if (oldOwner) {
+            await removeOwnerPermissions(
+              channel,
+              oldOwner.id
             );
           }
 
-          if (
-            String(
-              lockedRoom.owner_id
-            ) !==
-            pending.ownerId
-          ) {
-            throw new Error(
-              'TRANSFER_OWNER_CHANGED'
-            );
-          }
-
-          const duplicate =
-            await dbClient.query(
-              `
-                SELECT channel_id
-                FROM rooms
-                WHERE
-                  guild_id = $1
-                  AND owner_id = $2
-                  AND channel_id <> $3
-                LIMIT 1
-              `,
-              [
-                guild.id,
-                newOwner.id,
-                channel.id
-              ]
-            );
-
-          if (
-            duplicate.rowCount >
-            0
-          ) {
-            throw new Error(
-              'TRANSFER_TARGET_HAS_ROOM'
-            );
-          }
-
-          await updateRoomOwner(
-            channel.id,
-            newOwner.id,
-            dbClient
-          );
-
-          await dbClient.query(
-            'COMMIT'
-          );
-        } catch (error) {
-          await dbClient.query(
-            'ROLLBACK'
-          ).catch(
-            () => {}
-          );
-
-          throw error;
-        } finally {
-          dbClient.release();
-        }
-
-        try {
           await grantOwnerPermissions(
             channel,
             newOwner
-          );
-
-          await removeOwnerPermissions(
-            channel,
-            oldOwner
           );
 
           await ensureBotRoomPermissions(
             channel
           );
         } catch (permissionError) {
-          logError(
-            `TRANSFER_PERMISSION:${channel.id}`,
-            permissionError
-          );
-
           try {
-            await updateRoomOwner(
+            await transferRoomOwner(
               channel.id,
-              oldOwner.id
+              pending.ownerId
             );
+          } catch {
+          }
 
-            await grantOwnerPermissions(
-              channel,
-              oldOwner
-            );
-
-            await safeDeleteOverwrite(
-              channel,
-              newOwner.id,
-              `${BOT_NAME}: hoàn tác chuyển chủ lỗi`
-            );
-
-            await ensureBotRoomPermissions(
-              channel
-            );
-          } catch (rollbackError) {
-            logError(
-              `TRANSFER_ROLLBACK:${channel.id}`,
-              rollbackError
-            );
+          if (oldOwner) {
+            try {
+              await grantOwnerPermissions(
+                channel,
+                oldOwner
+              );
+            } catch {
+            }
           }
 
           throw permissionError;
@@ -8694,6 +8681,7 @@ async function handleTransferDecline(
     SUCCESS_DELETE_MS
   );
 }
+
 function compactLogText(
   value,
   maxLength =
@@ -9205,7 +9193,6 @@ async function sendChatCreateLog(
     }
   }
 }
-
 async function hydratePartialMessage(
   message
 ) {
@@ -10033,7 +10020,6 @@ async function beginOwnerAbsence(
     absence.deadline_at
   );
 }
-
 async function memberOwnsOtherRoom(
   guildId,
   memberId,
@@ -10359,6 +10345,7 @@ async function applyAutomaticOwnershipTransfer(
     NOTICE_DELETE_MS
   );
 }
+
 async function processOwnerAbsenceExpiry(
   channelId
 ) {
@@ -10757,7 +10744,6 @@ const slashCommands = [
   command =>
     command.toJSON()
 );
-
 async function registerSlashCommands() {
   if (
     !client.application
@@ -10880,6 +10866,7 @@ async function handlePanelCommand(
     );
   }
 }
+
 async function handleClaimCommand(
   interaction
 ) {
@@ -11252,6 +11239,7 @@ async function handleClaimCommand(
     );
   }
 }
+
 function doctorLine(
   ok,
   label,
@@ -11330,32 +11318,15 @@ async function handleDoctorCommand(
     );
   }
 
-  lines.push(
-    doctorLine(
-      client.isReady(),
-      'Discord Gateway',
-      client.isReady()
-        ? `Ping ${client.ws.ping}ms`
-        : 'Chưa sẵn sàng'
-    )
-  );
-
   const generator =
     await getGenerator(
       interaction.guild.id
-    ).catch(
-      () => null
     );
 
   lines.push(
     doctorLine(
-      Boolean(
-        generator
-      ),
-      'Cấu hình server',
-      generator
-        ? generator.display_name
-        : 'Chưa cài đặt'
+      Boolean(generator),
+      'Cấu hình server'
     )
   );
 
@@ -11543,6 +11514,7 @@ async function handleDoctorCommand(
     components: []
   });
 }
+
 async function reconcileGeneratorVoice(
   guild,
   generator
@@ -11850,6 +11822,7 @@ async function reconcileGuild(
     guild
   );
 }
+
 async function reconcileAllGuilds() {
   for (
     const guild
@@ -11977,7 +11950,6 @@ async function handleSystemResetCancel(
   });
   deleteReplyLater(interaction, SUCCESS_DELETE_MS);
 }
-
 async function routeButtonInteraction(
   interaction
 ) {
@@ -11998,6 +11970,12 @@ async function routeButtonInteraction(
 
     case 'setup_reinstall_confirm':
       await handleReinstallConfirm(
+        interaction
+      );
+      return;
+
+    case 'setup_uninstall':
+      await handleSetupUninstall(
         interaction
       );
       return;
@@ -12156,6 +12134,7 @@ async function routeSelectInteraction(
     );
   }
 }
+
 async function routeModalInteraction(
   interaction
 ) {
@@ -12364,6 +12343,7 @@ client.on(
     }
   }
 );
+
 client.on(
   Events.MessageCreate,
   async message => {
@@ -12643,6 +12623,7 @@ client.on(
     }
   }
 );
+
 client.once(
   Events.ClientReady,
   async readyClient => {
