@@ -1,19 +1,19 @@
 {
   "name": "voice-hdk",
-  "version": "3.5.1-fixed",
   "private": true,
-  "description": "Voice HDK Discord Temp Voice bot",
+  "description": "Voice HDK - Discord Temporary Voice Room System",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js",
     "check": "node --check index.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.0.0"
   },
   "dependencies": {
     "discord.js": "^14.22.1",
-    "dotenv": "^16.6.1",
+    "dotenv": "^17.2.2",
     "pg": "^8.16.3"
   }
 }
