@@ -1,0 +1,14 @@
+{
+  "name": "voice-hdk",
+  "version": "8.1.1",
+  "private": true,
+  "description": "Voice HDK - Discord Temporary Voice Bot",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "discord.js": "^14.22.1",
+    "pg": "^8.16.3"
+  }
+}
