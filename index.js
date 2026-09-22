@@ -823,46 +823,6 @@ async function initDatabase() {
     );
 
     await dbClient.query(
-      `
-        CREATE TABLE IF NOT EXISTS room_member_presence (
-          guild_id BIGINT NOT NULL,
-          channel_id BIGINT NOT NULL,
-          member_id BIGINT NOT NULL,
-          joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          PRIMARY KEY (channel_id, member_id)
-        )
-      `
-    );
-
-    await dbClient.query(
-      `
-        CREATE INDEX IF NOT EXISTS room_member_presence_guild_channel_idx
-        ON room_member_presence (guild_id, channel_id, joined_at)
-      `
-    );
-
-    await dbClient.query(
-      `
-        CREATE TABLE IF NOT EXISTS room_owner_absence (
-          channel_id BIGINT PRIMARY KEY,
-          guild_id BIGINT NOT NULL,
-          owner_id BIGINT NOT NULL,
-          owner_name TEXT,
-          started_at TIMESTAMPTZ NOT NULL,
-          expires_at TIMESTAMPTZ NOT NULL,
-          notice_message_id BIGINT
-        )
-      `
-    );
-
-    await dbClient.query(
-      `
-        CREATE INDEX IF NOT EXISTS room_owner_absence_guild_idx
-        ON room_owner_absence (guild_id)
-      `
-    );
-
-    await dbClient.query(
       'COMMIT'
     );
   } catch (error) {
@@ -1157,26 +1117,6 @@ async function deleteRoomRecord(
   dbClient = pool
 ) {
   await dbClient.query(
-    `
-      DELETE FROM room_member_presence
-      WHERE channel_id = $1
-    `,
-    [
-      channelId
-    ]
-  );
-
-  await dbClient.query(
-    `
-      DELETE FROM room_owner_absence
-      WHERE channel_id = $1
-    `,
-    [
-      channelId
-    ]
-  );
-
-  await dbClient.query(
     `DELETE FROM room_presence WHERE channel_id = $1`,
     [channelId]
   );
@@ -1202,26 +1142,6 @@ async function deleteGuildRoomRecords(
   dbClient = pool
 ) {
   await dbClient.query(
-    `
-      DELETE FROM room_member_presence
-      WHERE guild_id = $1
-    `,
-    [
-      guildId
-    ]
-  );
-
-  await dbClient.query(
-    `
-      DELETE FROM room_owner_absence
-      WHERE guild_id = $1
-    `,
-    [
-      guildId
-    ]
-  );
-
-  await dbClient.query(
     `DELETE FROM room_presence WHERE guild_id = $1`,
     [guildId]
   );
@@ -1240,315 +1160,6 @@ async function deleteGuildRoomRecords(
       guildId
     ]
   );
-}
-async function recordMemberPresence(
-  guildId,
-  channelId,
-  memberId,
-  joinedAt = new Date()
-) {
-  const validDate =
-    joinedAt instanceof Date
-      ? joinedAt
-      : new Date(joinedAt);
-
-  await pool.query(
-    `
-      INSERT INTO room_member_presence (
-        guild_id,
-        channel_id,
-        member_id,
-        joined_at
-      )
-      VALUES (
-        $1,
-        $2,
-        $3,
-        $4
-      )
-      ON CONFLICT (
-        channel_id,
-        member_id
-      )
-      DO NOTHING
-    `,
-    [
-      guildId,
-      channelId,
-      memberId,
-      validDate
-    ]
-  );
-}
-
-async function removeMemberPresence(
-  channelId,
-  memberId
-) {
-  await pool.query(
-    `
-      DELETE FROM room_member_presence
-      WHERE
-        channel_id = $1
-        AND member_id = $2
-    `,
-    [
-      channelId,
-      memberId
-    ]
-  );
-}
-
-async function clearRoomPresence(
-  channelId,
-  dbClient = pool
-) {
-  await dbClient.query(
-    `
-      DELETE FROM room_member_presence
-      WHERE channel_id = $1
-    `,
-    [
-      channelId
-    ]
-  );
-}
-
-async function getRoomPresence(
-  channelId
-) {
-  const result =
-    await pool.query(
-      `
-        SELECT *
-        FROM room_member_presence
-        WHERE channel_id = $1
-        ORDER BY
-          joined_at ASC,
-          member_id ASC
-      `,
-      [
-        channelId
-      ]
-    );
-
-  return result.rows;
-}
-
-async function getMemberJoinedAt(
-  channelId,
-  memberId
-) {
-  const result =
-    await pool.query(
-      `
-        SELECT joined_at
-        FROM room_member_presence
-        WHERE
-          channel_id = $1
-          AND member_id = $2
-        LIMIT 1
-      `,
-      [
-        channelId,
-        memberId
-      ]
-    );
-
-  return (
-    result.rows[0]?.joined_at ||
-    null
-  );
-}
-
-async function saveOwnerAbsence({
-  guildId,
-  channelId,
-  ownerId,
-  ownerName,
-  startedAt,
-  expiresAt,
-  noticeMessageId = null
-}) {
-  const result =
-    await pool.query(
-      `
-        INSERT INTO room_owner_absence (
-          channel_id,
-          guild_id,
-          owner_id,
-          owner_name,
-          started_at,
-          expires_at,
-          notice_message_id
-        )
-        VALUES (
-          $1,
-          $2,
-          $3,
-          $4,
-          $5,
-          $6,
-          $7
-        )
-        ON CONFLICT (channel_id)
-        DO UPDATE SET
-          guild_id = EXCLUDED.guild_id,
-          owner_id = EXCLUDED.owner_id,
-          owner_name = EXCLUDED.owner_name,
-          started_at = EXCLUDED.started_at,
-          expires_at = EXCLUDED.expires_at,
-          notice_message_id = EXCLUDED.notice_message_id
-        RETURNING *
-      `,
-      [
-        channelId,
-        guildId,
-        ownerId,
-        ownerName,
-        startedAt,
-        expiresAt,
-        noticeMessageId
-      ]
-    );
-
-  return result.rows[0];
-}
-
-async function updateOwnerAbsenceNotice(
-  channelId,
-  noticeMessageId
-) {
-  await pool.query(
-    `
-      UPDATE room_owner_absence
-      SET notice_message_id = $1
-      WHERE channel_id = $2
-    `,
-    [
-      noticeMessageId,
-      channelId
-    ]
-  );
-}
-
-async function getOwnerAbsence(
-  channelId
-) {
-  const result =
-    await pool.query(
-      `
-        SELECT *
-        FROM room_owner_absence
-        WHERE channel_id = $1
-        LIMIT 1
-      `,
-      [
-        channelId
-      ]
-    );
-
-  return (
-    result.rows[0] ||
-    null
-  );
-}
-
-async function getAllOwnerAbsences() {
-  const result =
-    await pool.query(
-      `
-        SELECT *
-        FROM room_owner_absence
-        ORDER BY expires_at ASC
-      `
-    );
-
-  return result.rows;
-}
-
-async function deleteOwnerAbsence(
-  channelId,
-  dbClient = pool
-) {
-  await dbClient.query(
-    `
-      DELETE FROM room_owner_absence
-      WHERE channel_id = $1
-    `,
-    [
-      channelId
-    ]
-  );
-}
-
-function clearRuntimeOwnerAbsenceTimer(
-  channelId
-) {
-  const key =
-    String(
-      channelId
-    );
-
-  const timer =
-    ownerAbsenceRuntimeTimers.get(
-      key
-    );
-
-  if (timer) {
-    clearTimeout(
-      timer
-    );
-
-    ownerAbsenceRuntimeTimers.delete(
-      key
-    );
-  }
-}
-
-async function withRoomLifecycleLock(
-  channelId,
-  task
-) {
-  const key =
-    String(
-      channelId
-    );
-
-  const previous =
-    roomLifecycleLocks.get(
-      key
-    ) ||
-    Promise.resolve();
-
-  const current =
-    previous
-      .catch(
-        () => {}
-      )
-      .then(
-        task
-      );
-
-  roomLifecycleLocks.set(
-    key,
-    current
-  );
-
-  try {
-    return await current;
-  } finally {
-    if (
-      roomLifecycleLocks.get(
-        key
-      ) ===
-      current
-    ) {
-      roomLifecycleLocks.delete(
-        key
-      );
-    }
-  }
 }
 function selectedMemberKey(
   guildId,
@@ -2598,6 +2209,7 @@ async function setRoomHidden(
       : `${BOT_NAME}: hiện phòng`
   );
 }
+
 async function inviteMemberToRoom(
   channel,
   member,
@@ -2966,7 +2578,10 @@ async function safeDeferReply(
   }
 
   await interaction.deferReply({
-    flags: ephemeral ? MessageFlags.Ephemeral : undefined
+    flags:
+      ephemeral
+        ? MessageFlags.Ephemeral
+        : undefined
   });
 }
 
@@ -2981,10 +2596,11 @@ function buildStatusEmbed(
         : 0x57F287
     )
     .setDescription(
-      String(content || '')
+      String(
+        content || ''
+      )
     );
 }
-
 async function tempReply(
   interaction,
   content,
@@ -5707,7 +5323,6 @@ async function recordVoiceJoinIfManaged(
     new Date()
   );
 }
-
 async function recordVoiceLeaveIfManaged(
   channelId,
   memberId
@@ -5957,6 +5572,7 @@ async function handleJoinCreateVoice(
     }
   );
 }
+
 async function deleteEmptyRoom(
   channelId
 ) {
@@ -6482,7 +6098,6 @@ async function handleRoomMemberSelect(
     member.id
   );
 }
-
 async function handleRoomLock(
   interaction
 ) {
@@ -6694,6 +6309,7 @@ async function handleRoomHide(
     );
   }
 }
+
 async function handleRoomRenameButton(
   interaction
 ) {
@@ -7835,7 +7451,6 @@ async function handleRoomRegionSelect(
     );
   }
 }
-
 async function handleRoomTransferButton(
   interaction
 ) {
@@ -9591,7 +9206,6 @@ async function sendBulkDeleteLog(
     }
   });
 }
-
 async function ensureOwnershipTrackingTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS room_presence (
@@ -9953,6 +9567,7 @@ async function cancelOwnerAbsence(
     }
   }
 }
+
 async function sendOwnerAbsenceNotice(
   channel,
   owner,
@@ -10829,6 +10444,7 @@ async function handleOwnerVoiceTransition(
     }
   }
 }
+
 const slashCommands = [
   new SlashCommandBuilder()
     .setName(
@@ -10873,7 +10489,6 @@ const slashCommands = [
   command =>
     command.toJSON()
 );
-
 async function registerSlashCommands() {
   if (
     !client.application
@@ -11410,7 +11025,6 @@ function doctorLine(
     }`
   );
 }
-
 async function handleDoctorCommand(
   interaction
 ) {
